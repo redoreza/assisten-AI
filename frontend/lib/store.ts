@@ -66,6 +66,9 @@ const assistantMsgRef = { current: null as string | null, finalApplied: false }
 // Deferred drop of assistantSpeaking — if a new chunk starts within 300 ms of
 // the previous one ending we cancel the drop so VAD doesn't flicker.
 let speakingResetTimer: number | null = null
+// True when `done` arrived while audio was still playing — busy is cleared
+// only after the last audio chunk ends and the echo-clearance delay passes.
+let donePending = false
 // Sources for the next assistant message — they arrive BEFORE the streaming
 // text starts, so we buffer them and attach to the next created bubble.
 let pendingSources: {
@@ -167,6 +170,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     ws = null
     audioQ?.stop()
     visemeBuffer.clear()
+    donePending = false
     setBusy(set, false)
     set({ status: 'closed', ready: false })
   },
@@ -179,6 +183,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
     assistantMsgRef.current = null
     assistantMsgRef.finalApplied = false
+    donePending = false
     set((s) => ({
       messages: [...s.messages, { id: newId(), role: 'user', text: message }],
       latestTiming: null,
@@ -203,6 +208,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
     assistantMsgRef.current = null
     assistantMsgRef.finalApplied = false
+    donePending = false
     const placeholderId = newId()
     set((s) => ({
       messages: [
@@ -244,6 +250,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   clearHistory: () => {
     set({ messages: [], latestTiming: null })
     visemeBuffer.clear()
+    donePending = false
     setBusy(set, false)
     ws?.send({ type: 'clear_history' })
     audioQ?.stop()
@@ -345,14 +352,20 @@ function handleServerMsg(
 
     case 'audio': {
       const seq = m.sequence
+      // Gate VAD immediately — before the async audio.play() chain resolves —
+      // so `done` arriving while decoding can't re-open the mic prematurely.
+      if (speakingResetTimer !== null) {
+        window.clearTimeout(speakingResetTimer)
+        speakingResetTimer = null
+      }
+      set({ assistantSpeaking: true })
       ensureAudioQueue().enqueueBase64Mp3(m.data, seq, {
         onStart: (sequence, audioEl) => {
-          // Cancel any pending "stop speaking" timer — a new chunk just started
+          // Cancel any end-of-chunk reset that fired between chunks.
           if (speakingResetTimer !== null) {
             window.clearTimeout(speakingResetTimer)
             speakingResetTimer = null
           }
-          set({ assistantSpeaking: true })
           const visemes = visemeBuffer.get(sequence) ?? []
           for (const cb of audioStartListeners) {
             try {
@@ -364,16 +377,21 @@ function handleServerMsg(
         },
         onEnd: (sequence) => {
           visemeBuffer.delete(sequence)
-          // Defer the reset by 300 ms so back-to-back chunks (typical for
-          // sentence-streaming TTS) don't flicker assistantSpeaking off/on.
-          // onStart of the next chunk will cancel this timer.
+          // Defer the reset so back-to-back chunks don't flicker
+          // assistantSpeaking. 800 ms gives room echo time to decay so the
+          // mic doesn't pick up residual TTS reverb after the last chunk.
           if (speakingResetTimer !== null) {
             window.clearTimeout(speakingResetTimer)
           }
           speakingResetTimer = window.setTimeout(() => {
             speakingResetTimer = null
             set({ assistantSpeaking: false })
-          }, 300)
+            // If `done` arrived while audio was playing, unblock the mic now.
+            if (donePending) {
+              donePending = false
+              setBusy(set, false)
+            }
+          }, 800)
           for (const cb of audioEndListeners) {
             try {
               cb(sequence)
@@ -397,7 +415,13 @@ function handleServerMsg(
       break
 
     case 'done':
-      setBusy(set, false)
+      // If audio is still playing, defer busy clear to after the echo-
+      // clearance delay so the VAD doesn't reopen while TTS is audible.
+      if (get().assistantSpeaking) {
+        donePending = true
+      } else {
+        setBusy(set, false)
+      }
       if (assistantMsgRef.current && !assistantMsgRef.finalApplied) {
         const id = assistantMsgRef.current
         set((s) => ({
@@ -409,6 +433,7 @@ function handleServerMsg(
       break
 
     case 'error':
+      donePending = false
       setBusy(set, false)
       set((s) => ({
         messages: [

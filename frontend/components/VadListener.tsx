@@ -67,6 +67,11 @@ export function VadListener() {
         const vad = await MicVAD.new({
           baseAssetPath: '/',
           onnxWASMBasePath: '/',
+          additionalAudioConstraints: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
           // ── VAD tuning ──────────────────────────────────────────────────
           // Stock settings end a segment after only ~256ms of silence, so a
           // normal sentence with a mid-thought pause splits into two segments.

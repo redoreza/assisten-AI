@@ -205,7 +205,7 @@ DEFAULT_MODE=companion
 | FFmpeg | `winget install ffmpeg` | Untuk konversi audio webm→wav |
 | Visual C++ Build Tools | `winget install Microsoft.VisualStudio.2022.BuildTools` | **Wajib** untuk InsightFace. Pilih workload "Desktop development with C++". Tanpa ini `uv sync` gagal. |
 
-### Setup otomatis
+### Setup otomatis (direkomendasikan)
 
 Setelah semua prerequisites terinstall, jalankan dari PowerShell:
 
@@ -223,6 +223,49 @@ Script otomatis melakukan:
 - Buat folder `data/sqlite`, `data/chroma`, `data/knowledge_base`, `data/personas`
 - Salin `.env.example` → `.env`
 
+### Setup manual (tanpa uv)
+
+Jika tidak ingin menggunakan `uv`, bisa pakai `pip` dan `venv` biasa:
+
+```powershell
+# 1. Clone & masuk folder
+git clone https://github.com/redoreza/assisten-AI.git
+cd assisten-AI
+
+# 2. Python backend — buat virtual environment & install
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+cd ..
+
+# 3. Node.js frontend
+cd frontend
+npm install
+cd ..
+
+# 4. Buat folder data
+New-Item -ItemType Directory -Force data\sqlite, data\chroma, data\knowledge_base, data\personas
+
+# 5. Salin .env
+Copy-Item .env.example .env
+```
+
+> **Catatan `requirements.txt`:** File ini di-generate otomatis dari `uv.lock` dan mencantumkan semua 94 dependency beserta versi yang di-pin. Jika ada package yang gagal build (paling sering InsightFace), pastikan Visual C++ Build Tools sudah terinstall (lihat prerequisites di atas).
+
+### Jalankan backend setelah setup manual
+
+```powershell
+# Terminal 1 — backend (aktifkan venv dulu)
+cd backend
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --port 8000
+
+# Terminal 2 — frontend
+cd frontend
+npm run dev
+```
+
 ### Setelah setup
 
 1. Buka `.env` dan isi API keys:
@@ -232,16 +275,7 @@ Script otomatis melakukan:
 2. Pastikan file persona ada: `data/personas/pointer.json` (lihat format di §7)
 
 3. Jalankan aplikasi — double-click `start-pointer.bat`
-   atau manual di dua terminal terpisah:
-   ```powershell
-   # Terminal 1 — backend
-   cd backend
-   uv run uvicorn app.main:app --reload --port 8000
-
-   # Terminal 2 — frontend
-   cd frontend
-   npm run dev
-   ```
+   atau manual di dua terminal terpisah (lihat di atas)
 
 4. Buka http://localhost:3000
 
