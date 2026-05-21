@@ -79,6 +79,8 @@ class Settings(BaseSettings):
     face_model_name: str = "buffalo_l"
     face_match_threshold: float = 0.5
     face_det_size: int = 640
+    # Set to false to force CPU-only inference even when CUDA is available.
+    face_use_gpu: bool = True
     # Continuous learning — ported from detection-engine. When recognize() finds
     # a match with similarity ≥ adaptive_threshold, the new embedding is
     # appended to that person's profile (up to max_emb_per_person). Builds up

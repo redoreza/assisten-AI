@@ -78,6 +78,7 @@ class FaceRecognition:
         threshold: float,
         det_size: int,
         model_name: str,
+        use_gpu: bool = True,
         adaptive_enabled: bool = True,
         adaptive_threshold: float = 0.65,
         max_emb_per_person: int = 20,
@@ -86,6 +87,7 @@ class FaceRecognition:
         self._threshold = threshold
         self._det_size = det_size
         self._model_name = model_name
+        self._use_gpu = use_gpu
         self._adaptive_enabled = adaptive_enabled
         self._adaptive_threshold = adaptive_threshold
         self._max_emb_per_person = max_emb_per_person
@@ -96,14 +98,33 @@ class FaceRecognition:
     def _ensure_loaded_sync(self) -> tuple[FaceAnalysis, SQLiteFaceDB]:
         """Lazy init — first call may take 30-90s on a cold cache (model download)."""
         if self._app is None:
+            import onnxruntime as ort
+
+            available = ort.get_available_providers()
+            if self._use_gpu:
+                # Prefer CUDA (needs cuDNN), fall back to DirectML (Windows DX12),
+                # then CPU.
+                gpu_providers = [
+                    p for p in ["CUDAExecutionProvider", "DmlExecutionProvider"]
+                    if p in available
+                ]
+                providers = gpu_providers + ["CPUExecutionProvider"]
+            else:
+                providers = ["CPUExecutionProvider"]
+
             logger.info(
-                f"Loading InsightFace {self._model_name} (auto-downloads to "
-                "~/.insightface/models/ on first run)..."
+                f"Loading InsightFace {self._model_name} "
+                f"(providers={providers}, auto-downloads on first run)..."
             )
-            self._app = FaceAnalysis(
-                name=self._model_name, providers=["CPUExecutionProvider"]
-            )
+            self._app = FaceAnalysis(name=self._model_name, providers=providers)
             self._app.prepare(ctx_id=0, det_size=(self._det_size, self._det_size))
+            # Report which provider each sub-model actually loaded onto
+            for m in self._app.models.values():
+                try:
+                    active = m.session.get_providers()[0]
+                    logger.info(f"  {m.__class__.__name__}: {active}")
+                except Exception:
+                    pass
             logger.info(
                 f"InsightFace ready (model={self._model_name}, det_size={self._det_size})"
             )
@@ -257,6 +278,7 @@ def get_face_recognition() -> FaceRecognition:
             threshold=settings.face_match_threshold,
             det_size=settings.face_det_size,
             model_name=settings.face_model_name,
+            use_gpu=settings.face_use_gpu,
             adaptive_enabled=settings.face_adaptive_enabled,
             adaptive_threshold=settings.face_adaptive_threshold,
             max_emb_per_person=settings.face_max_emb_per_person,
