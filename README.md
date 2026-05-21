@@ -195,29 +195,57 @@ DEFAULT_MODE=companion
 
 ## 9. Setup (Windows)
 
-```powershell
-# Prerequisites:
-# - Python 3.11+  https://python.org
-# - Node.js 20+   https://nodejs.org
-# - FFmpeg:        winget install ffmpeg
-# - uv:            powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+### Prerequisites (install manual sekali saja)
 
+| Tool | Link | Catatan |
+|------|------|---------|
+| Python 3.11 atau 3.12 | https://python.org | Centang "Add to PATH" saat install |
+| Node.js 20+ LTS | https://nodejs.org | Pilih LTS |
+| Git | https://git-scm.com | |
+| FFmpeg | `winget install ffmpeg` | Untuk konversi audio webm→wav |
+| Visual C++ Build Tools | `winget install Microsoft.VisualStudio.2022.BuildTools` | **Wajib** untuk InsightFace. Pilih workload "Desktop development with C++". Tanpa ini `uv sync` gagal. |
+
+### Setup otomatis
+
+Setelah semua prerequisites terinstall, jalankan dari PowerShell:
+
+```powershell
 git clone https://github.com/redoreza/assisten-AI.git
 cd assisten-AI
-
-# Backend
-cd backend && uv sync && cd ..
-
-# Frontend
-cd frontend && npm install && cd ..
-
-# Konfigurasi
-copy .env.example .env   # lalu isi API keys
-
-# Jalankan (dua terminal)
-# Terminal 1: cd backend && uv run uvicorn app.main:app --reload --port 8000
-# Terminal 2: cd frontend && npm run dev
+.\scripts\setup_windows.ps1
 ```
+
+Script otomatis melakukan:
+- Verifikasi semua prerequisites dan beri pesan jelas kalau ada yang kurang
+- Install `uv` jika belum ada
+- `uv sync` — install semua Python dependencies dari `uv.lock`
+- `npm install` — install semua Node.js dependencies dari `package-lock.json`
+- Buat folder `data/sqlite`, `data/chroma`, `data/knowledge_base`, `data/personas`
+- Salin `.env.example` → `.env`
+
+### Setelah setup
+
+1. Buka `.env` dan isi API keys:
+   - `GROQ_API_KEY` — **wajib**, gratis di https://console.groq.com
+   - `TAVILY_API_KEY` — opsional, web search, gratis di https://app.tavily.com
+
+2. Pastikan file persona ada: `data/personas/pointer.json` (lihat format di §7)
+
+3. Jalankan aplikasi — double-click `start-pointer.bat`
+   atau manual di dua terminal terpisah:
+   ```powershell
+   # Terminal 1 — backend
+   cd backend
+   uv run uvicorn app.main:app --reload --port 8000
+
+   # Terminal 2 — frontend
+   cd frontend
+   npm run dev
+   ```
+
+4. Buka http://localhost:3000
+
+> **Catatan:** Pertama kali jalan, InsightFace akan download model `buffalo_l` (~300 MB) otomatis. Hanya sekali.
 
 ## 10. Milestone Development
 
