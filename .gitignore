@@ -1,0 +1,52 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+backend/.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+frontend/.next/
+frontend/out/
+.turbo/
+
+# Local data (runtime artifacts, not committed)
+data/sqlite/*.db
+data/chroma/
+data/knowledge_base/*
+!data/knowledge_base/.gitkeep
+
+# Avatars (large binary, dev only)
+frontend/public/avatars/*.vrm
+
+# Smoke-test artifacts
+scripts/_out/
+
+# Log files
+*.log
+*.err.log
+
+# Azure / misc artifacts
+*.csv
+
+# AI coding assistant local config (not for version control)
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store

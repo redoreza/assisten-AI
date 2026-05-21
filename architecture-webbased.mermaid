@@ -1,0 +1,110 @@
+graph TB
+    subgraph USER["👤 USER BROWSER (Client)"]
+        MIC["🎤 Microphone<br/>(WebRTC)"]
+        SPK["🔊 Audio Output<br/>(Web Audio API)"]
+        CANVAS["🎨 Canvas/WebGL<br/>Avatar Renderer"]
+        UI["⚛️ React/Next.js UI<br/>Chat + Avatar"]
+        
+        subgraph BROWSER_AVATAR["Avatar Engine (in-browser)"]
+            THREE["Three.js<br/>(3D VRM)"]
+            LIVE2D["Live2D Web SDK<br/>(2D models)"]
+            TH_LIB["TalkingHead.js<br/>(lip-sync engine)"]
+        end
+    end
+
+    subgraph CDN["☁️ CDN / Static Hosting"]
+        FRONTEND_HOST["Vercel / Netlify / Cloudflare Pages<br/>(React app, gratis)"]
+        ASSETS["Avatar Assets<br/>(.vrm, .moc3, voice samples)"]
+    end
+
+    subgraph VPS["🖥️ VPS (CPU-only, $10-20/mo)"]
+        subgraph NGINX["Nginx (Reverse Proxy + SSL)"]
+            SSL["Let's Encrypt"]
+        end
+        
+        subgraph BACKEND["FastAPI Backend"]
+            WS["WebSocket Handler<br/>(streaming)"]
+            REST_API["REST API"]
+            ORCH["Orchestrator<br/>(LangChain)"]
+            PERSONA["Persona Manager"]
+            RAG["RAG Engine"]
+            MEMORY["Memory Manager"]
+        end
+        
+        subgraph STORAGE["Local Storage"]
+            SQLITE[("SQLite<br/>chat history")]
+            CHROMA[("ChromaDB<br/>vector store")]
+            KB["📄 Knowledge Base<br/>files"]
+        end
+    end
+
+    subgraph EXTERNAL["🌍 EXTERNAL APIs (gratis tier)"]
+        subgraph LLM_API["LLM Provider"]
+            GROQ["Groq API<br/>Llama 3.3 70B<br/>⚡ super cepat, gratis"]
+            GEMINI["Google Gemini<br/>Flash (free tier)"]
+            CLAUDE_API["Claude Haiku<br/>(berbayar tapi murah)"]
+        end
+        
+        subgraph STT_API["STT Provider"]
+            GROQ_W["Groq Whisper<br/>(gratis tier besar)"]
+            DEEPGRAM["Deepgram<br/>$200 free credit"]
+            BROWSER_STT["Web Speech API<br/>(built-in browser)"]
+        end
+        
+        subgraph TTS_API["TTS Provider"]
+            ELEVEN["ElevenLabs<br/>(10k char/bulan free)"]
+            OPENAI_TTS["OpenAI TTS<br/>(murah, natural)"]
+            EDGE_TTS["Edge TTS<br/>(100% gratis)"]
+        end
+    end
+
+    %% User Flow
+    MIC -->|"audio stream"| WS
+    UI -->|"text msg"| REST_API
+    
+    %% Frontend Loading
+    FRONTEND_HOST -.->|"loads"| UI
+    ASSETS -.->|"loads"| THREE
+    ASSETS -.->|"loads"| LIVE2D
+    
+    %% Backend Processing
+    WS -->|"audio"| STT_API
+    STT_API -->|"transcript"| ORCH
+    REST_API --> ORCH
+    
+    ORCH --> PERSONA
+    ORCH --> MEMORY
+    ORCH -->|"query"| RAG
+    RAG <--> CHROMA
+    CHROMA -.->|"indexed"| KB
+    MEMORY <--> SQLITE
+    
+    ORCH -->|"prompt"| LLM_API
+    LLM_API -->|"streaming response"| ORCH
+    
+    ORCH -->|"text + emotion"| TTS_API
+    TTS_API -->|"audio + word timing"| WS
+    
+    %% Output to Browser
+    WS -->|"audio chunks"| SPK
+    WS -->|"viseme data"| TH_LIB
+    WS -->|"emotion tag"| TH_LIB
+    TH_LIB --> THREE
+    TH_LIB --> LIVE2D
+    THREE --> CANVAS
+    LIVE2D --> CANVAS
+    CANVAS --> UI
+
+    classDef user fill:#e1f5ff,stroke:#0288d1,stroke-width:2px,color:#000
+    classDef browser fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    classDef cdn fill:#e8f5e9,stroke:#388e3c,stroke-width:2px,color:#000
+    classDef vps fill:#fff4e1,stroke:#f57c00,stroke-width:2px,color:#000
+    classDef external fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
+    classDef storage fill:#fce4ec,stroke:#c2185b,stroke-width:2px,color:#000
+
+    class MIC,SPK,CANVAS,UI user
+    class THREE,LIVE2D,TH_LIB browser
+    class FRONTEND_HOST,ASSETS cdn
+    class NGINX,SSL,WS,REST_API,ORCH,PERSONA,RAG,MEMORY vps
+    class GROQ,GEMINI,CLAUDE_API,GROQ_W,DEEPGRAM,BROWSER_STT,ELEVEN,OPENAI_TTS,EDGE_TTS external
+    class SQLITE,CHROMA,KB storage
