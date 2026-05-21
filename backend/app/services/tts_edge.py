@@ -195,20 +195,85 @@ def get_edge_tts() -> EdgeTTS:
     return _singleton
 
 
-def get_tts():
+_AZURE_COOLDOWN_S = 120.0  # retry a failed Azure key after this many seconds
+
+
+class TTSWithFallback:
+    """Azure primary → Azure backup key → Edge TTS fallback chain.
+
+    Failure modes handled:
+    - Init failure on a key  → skip that key, try next in chain at startup.
+    - Per-call failure (rate limit / quota / 5xx) → mark that key on cooldown,
+      retry the same sentence with the next entry immediately; retry the key
+      again after _AZURE_COOLDOWN_S seconds in case of transient failures.
+    Chain: [Azure key1] → [Azure key2 if configured] → [Edge TTS]
+    """
+
+    def __init__(self) -> None:
+        import time as _time
+        from app.services.tts_azure import AzureTTS
+
+        self._chain: list[AzureTTS] = []
+        self._edge = get_edge_tts()
+        # Maps chain index → timestamp of last failure (0 = never failed)
+        self._failed_at: dict[int, float] = {}
+        self._time = _time
+
+        for idx, key in enumerate(
+            [settings.azure_speech_key, settings.azure_speech_key_2]
+        ):
+            if not key:
+                continue
+            try:
+                self._chain.append(
+                    AzureTTS(default_voice=settings.tts_voice_default, api_key=key)
+                )
+                label = "primary" if idx == 0 else "backup"
+                logger.info(f"TTSWithFallback: Azure {label} key loaded (idx={idx})")
+            except Exception as exc:
+                logger.warning(f"TTSWithFallback: Azure key[{idx}] init failed: {exc}")
+
+        if self._chain:
+            logger.info(
+                f"TTSWithFallback: {len(self._chain)} Azure key(s) + Edge fallback"
+            )
+        else:
+            logger.info("TTSWithFallback: no Azure key configured, using Edge only")
+
+    def _is_available(self, idx: int) -> bool:
+        t = self._failed_at.get(idx, 0.0)
+        return t == 0.0 or (self._time.monotonic() - t) >= _AZURE_COOLDOWN_S
+
+    async def synthesize(self, text: str, **kwargs) -> TTSResult:
+        for idx, provider in enumerate(self._chain):
+            if not self._is_available(idx):
+                continue
+            try:
+                return await provider.synthesize(text, **kwargs)
+            except Exception as exc:
+                self._failed_at[idx] = self._time.monotonic()
+                remaining = sum(
+                    1 for i in range(idx + 1, len(self._chain))
+                    if self._is_available(i)
+                )
+                next_label = f"Azure key[{idx + 1}]" if remaining > 0 else "Edge TTS"
+                logger.warning(
+                    f"TTSWithFallback: Azure key[{idx}] failed → {next_label} "
+                    f"(will retry in {_AZURE_COOLDOWN_S:.0f}s): {exc}"
+                )
+        return await self._edge.synthesize(text, **kwargs)
+
+
+_tts_with_fallback: TTSWithFallback | None = None
+
+
+def get_tts() -> TTSWithFallback:
     """Public TTS accessor used by the orchestrator.
 
-    Picks Azure Speech (SSML-enabled, more conversational rhythm) when
-    AZURE_SPEECH_KEY is set, otherwise falls back to the free Edge TTS
-    endpoint. Both providers implement the same `synthesize(...)` contract.
+    Returns a TTSWithFallback instance: Azure primary when AZURE_SPEECH_KEY
+    is set, Edge TTS as automatic fallback on init or per-call failure.
     """
-    if settings.azure_speech_key:
-        try:
-            from app.services.tts_azure import get_azure_tts
-
-            return get_azure_tts()
-        except Exception as exc:
-            # Don't take the whole pipeline down if Azure init fails — fall
-            # back to Edge so the assistant still talks.
-            logger.warning(f"Azure TTS unavailable, falling back to Edge: {exc}")
-    return get_edge_tts()
+    global _tts_with_fallback
+    if _tts_with_fallback is None:
+        _tts_with_fallback = TTSWithFallback()
+    return _tts_with_fallback

@@ -45,7 +45,11 @@ class Settings(BaseSettings):
     # router uses Azure (SSML, prosody/break tags) instead of free Edge TTS.
     azure_speech_key: str = Field(
         default="",
-        description="Azure Speech key — enables higher-quality SSML TTS when set",
+        description="Azure Speech key (primary) — enables higher-quality SSML TTS when set",
+    )
+    azure_speech_key_2: str = Field(
+        default="",
+        description="Azure Speech key (backup) — tried when primary key hits rate limit",
     )
     azure_speech_region: str = "southeastasia"
 

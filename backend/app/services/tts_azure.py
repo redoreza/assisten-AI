@@ -125,10 +125,15 @@ def build_ssml(text: str, voice: str, rate: str, pitch: str) -> str:
 
 
 class AzureTTS:
-    def __init__(self, default_voice: str | None = None) -> None:
-        if not settings.azure_speech_key:
+    def __init__(
+        self,
+        default_voice: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        key = api_key or settings.azure_speech_key
+        if not key:
             raise ValueError("AZURE_SPEECH_KEY not configured")
-        self._key = settings.azure_speech_key
+        self._key = key
         self._region = settings.azure_speech_region
         self._default_voice = default_voice or settings.tts_voice_default
         # 24kHz 160kbps mono MP3 matches Edge TTS output format so the frontend

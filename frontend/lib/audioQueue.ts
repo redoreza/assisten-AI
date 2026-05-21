@@ -19,6 +19,7 @@ interface QueueItem {
 export class AudioQueue {
   private queue: QueueItem[] = []
   private current: HTMLAudioElement | null = null
+  private currentItem: QueueItem | null = null
   private playing = false
   private allObjectUrls: string[] = []
 
@@ -52,6 +53,7 @@ export class AudioQueue {
     const audio = new Audio(item.url)
     audio.preload = 'auto'
     this.current = audio
+    this.currentItem = item
 
     audio.addEventListener(
       'ended',
@@ -90,6 +92,11 @@ export class AudioQueue {
       this.current.pause()
       this.current.src = ''
       this.current = null
+    }
+    // Fire onEnd for the interrupted item so store.ts resets assistantSpeaking.
+    if (this.currentItem) {
+      this.currentItem.onEnd?.(this.currentItem.sequence)
+      this.currentItem = null
     }
     this.queue = []
     this.playing = false

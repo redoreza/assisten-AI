@@ -143,6 +143,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Each connection gets a generation id; callbacks check it so a late event
     // from a previous socket can't mutate state for the current one.
     const gen = ++wsGeneration
+    donePending = false
     setBusy(set, false)
     set({ status: 'connecting', ready: false })
     ws = connectWs(WS_URL, {
@@ -434,6 +435,7 @@ function handleServerMsg(
 
     case 'error':
       donePending = false
+      pendingSources = null
       setBusy(set, false)
       set((s) => ({
         messages: [

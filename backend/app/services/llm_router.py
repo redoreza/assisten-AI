@@ -110,10 +110,13 @@ class LLMRouter:
     def _candidates(self) -> list[LLMProvider]:
         n = len(self._providers)
         start = self._next_idx
-        self._next_idx = (self._next_idx + 1) % n
         ordered = [self._providers[(start + i) % n] for i in range(n)]
         healthy = [p for p in ordered if self._is_healthy(p)]
         unhealthy = [p for p in ordered if not self._is_healthy(p)]
+        # Only advance the cursor when healthy providers exist so the first
+        # provider to recover is always tried first after a full-outage window.
+        if healthy:
+            self._next_idx = (self._next_idx + 1) % n
         return healthy + unhealthy
 
     def stats(self) -> dict[str, dict[str, int]]:
@@ -221,11 +224,18 @@ def build_router() -> LLMRouter:
         from app.services.llm_nvidia import NvidiaLLM
 
         providers.append(NvidiaLLM())
-    providers.append(GroqLLM())
+    if settings.groq_api_key:
+        providers.append(GroqLLM())
     if settings.openrouter_api_key:
         from app.services.llm_openrouter import OpenRouterLLM
 
         providers.append(OpenRouterLLM())
+
+    if not providers:
+        raise RuntimeError(
+            "No LLM provider configured. Set at least one of: "
+            "NVIDIA_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY in .env"
+        )
 
     names = " + ".join(p.name for p in providers)
     logger.info(f"[llm_router] providers ({len(providers)}, round-robin): {names}")
