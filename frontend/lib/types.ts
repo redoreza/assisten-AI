@@ -24,6 +24,7 @@ export type ClientMsg =
       image_base64: string
     }
   | { type: 'face_lost' }
+  | { type: 'interrupt' }
 
 export type ServerMsg =
   | { type: 'ready'; persona_id: string; mode: string }

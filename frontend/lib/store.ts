@@ -52,6 +52,7 @@ interface ChatState {
   }) => void
   sendFaceLost: () => void
   setFacePresent: (present: boolean) => void
+  interruptAssistant: () => void
 }
 
 let ws: WsHandle | null = null
@@ -69,6 +70,9 @@ let speakingResetTimer: number | null = null
 // True when `done` arrived while audio was still playing — busy is cleared
 // only after the last audio chunk ends and the echo-clearance delay passes.
 let donePending = false
+// Set to true when the user barges in — drop incoming audio chunks from the
+// old pipeline until the new turn starts (sendAudio resets it to false).
+let bargeinActive = false
 // Sources for the next assistant message — they arrive BEFORE the streaming
 // text starts, so we buffer them and attach to the next created bubble.
 let pendingSources: {
@@ -195,10 +199,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   sendAudio: async (audioBlob: Blob, format: 'webm' | 'mp3' | 'wav') => {
     if (!ws) return
-    // Drop the second of two near-simultaneous triggers — the VAD can re-fire
-    // on a pause mid-utterance, which previously made Pointer answer twice.
     if (get().assistantBusy) {
-      console.warn('sendAudio ignored — a turn is already in progress')
+      // Pipeline in progress — route to backend light-chat queue.
+      // Don't create a new turn; backend transcribes and queues as light chat.
+      const data = await blobToBase64(audioBlob)
+      if (!ws) return
+      ws.send({ type: 'audio_chunk', data, format })
+      ws.send({ type: 'audio_end' })
       return
     }
     const data = await blobToBase64(audioBlob)
@@ -210,6 +217,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     assistantMsgRef.current = null
     assistantMsgRef.finalApplied = false
     donePending = false
+    bargeinActive = false
     const placeholderId = newId()
     set((s) => ({
       messages: [
@@ -252,9 +260,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({ messages: [], latestTiming: null })
     visemeBuffer.clear()
     donePending = false
+    bargeinActive = false
     setBusy(set, false)
     ws?.send({ type: 'clear_history' })
     audioQ?.stop()
+  },
+
+  interruptAssistant: () => {
+    if (!ws) return
+    audioQ?.stop()
+    if (speakingResetTimer !== null) {
+      window.clearTimeout(speakingResetTimer)
+      speakingResetTimer = null
+    }
+    donePending = false
+    bargeinActive = true
+    setBusy(set, false)
+    set({ assistantSpeaking: false })
+    ws.send({ type: 'interrupt' })
   },
 }))
 
@@ -307,6 +330,9 @@ function handleServerMsg(
           }
           const id = assistantMsgRef.current
           assistantMsgRef.finalApplied = true
+          // Null current so the next turn (e.g. main answer after light chat)
+          // creates a fresh bubble instead of appending to this one.
+          assistantMsgRef.current = null
           return {
             messages: s.messages.map((msg) =>
               msg.id === id ? { ...msg, text: m.text, pending: false } : msg
@@ -318,6 +344,8 @@ function handleServerMsg(
       if (!assistantMsgRef.current) {
         const id = newId()
         assistantMsgRef.current = id
+        // Reset finalApplied so a fresh bubble always starts clean.
+        assistantMsgRef.finalApplied = false
         // Attach any buffered sources to this new bubble
         const sources = pendingSources?.sources
         const searchQuery = pendingSources?.query
@@ -352,6 +380,7 @@ function handleServerMsg(
       break
 
     case 'audio': {
+      if (bargeinActive) break  // stale chunk from interrupted pipeline
       const seq = m.sequence
       // Gate VAD immediately — before the async audio.play() chain resolves —
       // so `done` arriving while decoding can't re-open the mic prematurely.

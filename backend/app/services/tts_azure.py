@@ -131,36 +131,42 @@ class AzureTTS:
         default_voice: str | None = None,
         api_key: str | None = None,
     ) -> None:
-        key = api_key or settings.azure_speech_key
-        if not key:
+        self._primary_key = api_key or settings.azure_speech_key
+        if not self._primary_key:
             raise ValueError("AZURE_SPEECH_KEY not configured")
         self._region = settings.azure_speech_region
         self._default_voice = default_voice or settings.tts_voice_default
-        # 24kHz 160kbps mono MP3 matches Edge TTS output format so the frontend
-        # AudioQueue behaves the same regardless of provider.
-        fmt = speechsdk.SpeechSynthesisOutputFormat.Audio24Khz160KBitRateMonoMp3
+        # threading.Lock: serialises _synth_sync and _recreate_synthesizer so the
+        # SDK is never called from two threads at once.
+        self._lock = threading.Lock()
+        # asyncio.Lock: ensures only ONE synthesize() call is ever in-flight at a
+        # time — serialises at the coroutine level before even reaching to_thread.
+        self._alock: asyncio.Lock | None = None  # created lazily (needs running loop)
+        # Per-call boundary accumulators; reset before each call.
+        self._cur_words: list[WordBoundary] = []
+        self._cur_sentences: list[SentenceBoundary] = []
 
+        self._synthesizer = self._build_synthesizer(self._primary_key)
+        logger.info(
+            f"AzureTTS ready (region={self._region}, default_voice={self._default_voice})"
+        )
+        # Open the WebSocket now so the first real synthesis call is fast.
+        threading.Thread(target=self._warmup, daemon=True).start()
+
+    # ── synthesizer lifecycle ──────────────────────────────────────────────────
+
+    def _build_synthesizer(self, key: str) -> speechsdk.SpeechSynthesizer:
+        """Create a fresh SpeechSynthesizer with boundary callback attached."""
+        fmt = speechsdk.SpeechSynthesisOutputFormat.Audio24Khz160KBitRateMonoMp3
         config = speechsdk.SpeechConfig(subscription=key, region=self._region)
         config.set_speech_synthesis_output_format(fmt)
         config.set_property(
             speechsdk.PropertyId.SpeechServiceResponse_RequestWordBoundary,
             "true",
         )
-        # Persistent synthesizer — keeps the underlying WebSocket connection open
-        # between calls so subsequent syntheses avoid the ~1s connection setup.
         # audio_config=None → audio bytes in result.audio_data only, no playback.
-        self._synthesizer = speechsdk.SpeechSynthesizer(
-            speech_config=config, audio_config=None
-        )
-        # Serialize concurrent calls; the SDK is not thread-safe.
-        self._lock = threading.Lock()
-        # Per-call boundary accumulators; reset inside the lock before each call.
-        self._cur_words: list[WordBoundary] = []
-        self._cur_sentences: list[SentenceBoundary] = []
+        synth = speechsdk.SpeechSynthesizer(speech_config=config, audio_config=None)
 
-        # Register a single persistent callback — EventSignal.connect() is the
-        # only registration API; there is no disconnect(). The callback writes
-        # to `_cur_words`/`_cur_sentences` which are cleared before each call.
         sentence_type = speechsdk.SpeechSynthesisBoundaryType.Sentence
         punct_type = speechsdk.SpeechSynthesisBoundaryType.Punctuation
 
@@ -178,13 +184,16 @@ class AzureTTS:
             else:
                 self._cur_words.append(entry)
 
-        self._synthesizer.synthesis_word_boundary.connect(_on_boundary)
+        synth.synthesis_word_boundary.connect(_on_boundary)
+        return synth
 
-        logger.info(
-            f"AzureTTS ready (region={self._region}, default_voice={self._default_voice})"
-        )
-        # Open the WebSocket now so the first real synthesis call is fast.
-        threading.Thread(target=self._warmup, daemon=True).start()
+    def _recreate_synthesizer(self, key: str | None = None) -> None:
+        """Replace _synthesizer with a fresh instance (call from a worker thread)."""
+        use_key = key or self._primary_key
+        new_synth = self._build_synthesizer(use_key)
+        with self._lock:
+            self._synthesizer = new_synth
+        logger.info(f"[TTS] Azure synthesizer recreated (key={'backup' if key else 'primary'})")
 
     def _warmup(self) -> None:
         try:
@@ -192,10 +201,20 @@ class AzureTTS:
             with self._lock:
                 self._cur_words = []
                 self._cur_sentences = []
-                self._synthesizer.speak_ssml(ssml)
-            logger.debug("AzureTTS WebSocket pre-warmed")
+                result = self._synthesizer.speak_ssml(ssml)
+            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                logger.debug("AzureTTS WebSocket pre-warmed")
+            else:
+                # Warmup failed — recreate so the synthesizer is in a clean state
+                # before the first real call arrives.
+                logger.warning(
+                    f"[TTS] Azure warmup non-OK (reason={result.reason}), recreating synthesizer"
+                )
+                self._recreate_synthesizer()
         except Exception as exc:
             logger.debug(f"AzureTTS warmup skipped: {exc}")
+
+    # ── synthesis ──────────────────────────────────────────────────────────────
 
     def _synth_sync(
         self, ssml: str
@@ -204,14 +223,10 @@ class AzureTTS:
             self._cur_words = []
             self._cur_sentences = []
             result = self._synthesizer.speak_ssml(ssml)
-            # Snapshot while still holding the lock so a concurrent warmup
-            # can't clobber the lists before we return them.
+            # Snapshot while still holding the lock so the callback thread
+            # can't append stale events after we read the lists.
             words = list(self._cur_words)
             sentences = list(self._cur_sentences)
-
-        # Re-warm the connection immediately after synthesis so the next call
-        # finds the WebSocket already open.
-        threading.Thread(target=self._warmup, daemon=True).start()
 
         if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
             details = f"reason={result.reason}"
@@ -232,14 +247,36 @@ class AzureTTS:
         rate: str = "+0%",
         pitch: str = "+0Hz",
     ) -> TTSResult:
-        voice_id = voice or self._default_voice
-        processed = _preprocess_text(text)
-        ssml = build_ssml(processed, voice_id, rate, pitch)
-        audio, words, sentences = await asyncio.to_thread(self._synth_sync, ssml)
-        logger.debug(
-            f"Azure TTS '{voice_id}' chars={len(text)} rate={rate} pitch={pitch} → "
-            f"{len(audio)} bytes, {len(words)} words, {len(sentences)} sentences"
+        # Lazy-initialise the asyncio.Lock on first async call (the event loop
+        # must be running when asyncio.Lock() is created).
+        if self._alock is None:
+            self._alock = asyncio.Lock()
+        async with self._alock:
+            voice_id = voice or self._default_voice
+            processed = _preprocess_text(text)
+            ssml = build_ssml(processed, voice_id, rate, pitch)
+            try:
+                audio, words, sentences = await asyncio.to_thread(self._synth_sync, ssml)
+            except RuntimeError as exc:
+                if "No audio was received" in str(exc) or "No audio" in str(exc):
+                    # Synthesizer WebSocket entered a bad state (common after
+                    # backend restart or a Canceled warmup). Recreate now so
+                    # the NEXT call gets a fresh connection, then fail fast so
+                    # TTSWithFallback can immediately try the next provider in
+                    # the chain (backup key → Edge TTS) without extra latency.
+                    logger.warning(
+                        "[TTS] Azure returned no audio — recreating synthesizer for next call"
+                    )
+                    await asyncio.to_thread(self._recreate_synthesizer)
+                raise
+        logger.info(
+            f"Azure TTS '{voice_id}' chars={len(text)} → "
+            f"{len(audio)} bytes, {len(words)} words"
         )
+        if not audio:
+            raise RuntimeError(
+                f"Azure TTS returned 0 bytes for text={text[:40]!r}"
+            )
         return {
             "audio": audio,
             "word_boundaries": words,

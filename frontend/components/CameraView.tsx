@@ -36,11 +36,14 @@ export function CameraView() {
   const [faces, setFaces] = useState<FaceMatch[]>([])
   const [lastLatencyMs, setLastLatencyMs] = useState<number | null>(null)
   const [recognizing, setRecognizing] = useState(false)
+  const [faceServiceDown, setFaceServiceDown] = useState(false)
 
   const streamRef = useRef<MediaStream | null>(null)
   const recognizeTimerRef = useRef<number | null>(null)
   const inFlightRef = useRef(false)
   const hasInitedRef = useRef(false)
+  // Consecutive network-error counter for exponential back-off (resets on success)
+  const consecutiveErrorsRef = useRef(0)
 
   // Bbox interpolation state — track last two server responses + timestamps.
   // Between server updates, the rAF loop extrapolates forward using linear
@@ -223,6 +226,12 @@ export function CameraView() {
 
   const recognizeTick = useCallback(async () => {
     if (inFlightRef.current) return
+    // Back-off: skip every other tick for 1 error, every 4th for 2+, every 8th for 3+
+    const errs = consecutiveErrorsRef.current
+    if (errs > 0) {
+      const skipMod = errs === 1 ? 2 : errs === 2 ? 4 : 8
+      if (Math.round(performance.now() / RECOGNIZE_INTERVAL_MS) % skipMod !== 0) return
+    }
     const frame = captureFrame()
     if (!frame) return
     inFlightRef.current = true
@@ -247,6 +256,8 @@ export function CameraView() {
       prevFacesTimeRef.current = lastFacesTimeRef.current
       lastFacesRef.current = scaled
       lastFacesTimeRef.current = performance.now()
+      consecutiveErrorsRef.current = 0
+      setFaceServiceDown(false)
       setFaces(scaled)
       setLastLatencyMs(Math.round(performance.now() - t0))
 
@@ -282,7 +293,13 @@ export function CameraView() {
         }
       }
     } catch (e: unknown) {
-      console.error('[CameraView] recognize failed', e)
+      consecutiveErrorsRef.current += 1
+      if (consecutiveErrorsRef.current === 3) {
+        console.error('[CameraView] face service unreachable after 3 attempts — backing off', e)
+        setFaceServiceDown(true)
+      } else if (consecutiveErrorsRef.current < 3) {
+        console.error('[CameraView] recognize failed', e)
+      }
     } finally {
       inFlightRef.current = false
       setRecognizing(false)
@@ -477,6 +494,12 @@ export function CameraView() {
                 Coba lagi
               </button>
             </div>
+          </div>
+        )}
+
+        {faceServiceDown && !errorMsg && (
+          <div className="absolute top-3 right-3 px-2 py-1 rounded bg-red-900/80 text-xs text-red-200 border border-red-700">
+            Face service offline — retrying…
           </div>
         )}
 

@@ -22,6 +22,10 @@ export class AudioQueue {
   private currentItem: QueueItem | null = null
   private playing = false
   private allObjectUrls: string[] = []
+  // Tracks elements stopped via stop() so their async error/ended events are
+  // suppressed — setting src='' triggers an error event asynchronously, which
+  // would cause a double onEnd call and a spurious console.error.
+  private _stoppedAudio = new WeakSet<HTMLAudioElement>()
 
   enqueueBase64Mp3(
     b64: string,
@@ -58,6 +62,7 @@ export class AudioQueue {
     audio.addEventListener(
       'ended',
       () => {
+        if (this._stoppedAudio.has(audio)) return
         item.onEnd?.(item.sequence)
         URL.revokeObjectURL(item.url)
         this.allObjectUrls = this.allObjectUrls.filter((u) => u !== item.url)
@@ -68,7 +73,9 @@ export class AudioQueue {
     audio.addEventListener(
       'error',
       () => {
-        console.error('Audio playback error for sequence', item.sequence)
+        if (this._stoppedAudio.has(audio)) return
+        const code = audio.error?.code ?? 'unknown'
+        console.error(`Audio playback error for sequence ${item.sequence} (MediaError code=${code})`)
         URL.revokeObjectURL(item.url)
         this.allObjectUrls = this.allObjectUrls.filter((u) => u !== item.url)
         item.onEnd?.(item.sequence)
@@ -81,14 +88,19 @@ export class AudioQueue {
       await audio.play()
       item.onStart?.(item.sequence, audio)
     } catch (e) {
-      console.warn('audio.play() rejected — needs a user gesture first', e)
+      // Suppress the async error event that fires after play() rejection
+      // so the queue isn't double-advanced and no spurious console.error appears.
+      this._stoppedAudio.add(audio)
+      console.warn(`audio.play() failed for sequence ${item.sequence}:`, e)
       URL.revokeObjectURL(item.url)
-      this.playing = false
+      this.allObjectUrls = this.allObjectUrls.filter((u) => u !== item.url)
+      void this.playNext()
     }
   }
 
   stop(): void {
     if (this.current) {
+      this._stoppedAudio.add(this.current)  // suppress the async error event
       this.current.pause()
       this.current.src = ''
       this.current = null

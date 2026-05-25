@@ -10,6 +10,9 @@ import { encodeWav } from '@/lib/wav'
 const VAD_SAMPLE_RATE = 16000
 /** Wait this long after losing face before pausing VAD — survives brief turns. */
 const FACE_GRACE_MS = 5000
+/** Delay before barge-in is armed after TTS starts — gives echo cancellation
+ *  time to adapt so Pointer's own audio doesn't trigger a self-interrupt. */
+const BARGE_IN_ARM_DELAY_MS = 800
 
 type VadState =
   | 'idle'
@@ -30,8 +33,38 @@ export function VadListener() {
   const wsReady = useChatStore((s) => s.ready)
   const facePresent = useChatStore((s) => s.facePresent)
   const assistantSpeaking = useChatStore((s) => s.assistantSpeaking)
-  const assistantBusy = useChatStore((s) => s.assistantBusy)
   const awaitingName = useChatStore((s) => s.awaitingName)
+  const interruptAssistant = useChatStore((s) => s.interruptAssistant)
+
+  const assistantSpeakingRef = useRef(false)
+  useEffect(() => { assistantSpeakingRef.current = assistantSpeaking }, [assistantSpeaking])
+  const interruptRef = useRef(interruptAssistant)
+  useEffect(() => { interruptRef.current = interruptAssistant }, [interruptAssistant])
+
+  // Arms barge-in only after echo cancellation has had time to adapt.
+  const bargeinArmedRef = useRef(false)
+  const bargeinArmTimerRef = useRef<number | null>(null)
+  // Set to true when onSpeechStart fires during the unarmed window — tells
+  // onSpeechEnd to drop the audio (it's echo, not real speech).
+  const echoTriggerRef = useRef(false)
+
+  useEffect(() => {
+    if (assistantSpeaking) {
+      bargeinArmedRef.current = false
+      if (bargeinArmTimerRef.current !== null) window.clearTimeout(bargeinArmTimerRef.current)
+      bargeinArmTimerRef.current = window.setTimeout(() => {
+        bargeinArmedRef.current = true
+        bargeinArmTimerRef.current = null
+      }, BARGE_IN_ARM_DELAY_MS)
+    } else {
+      bargeinArmedRef.current = false
+      echoTriggerRef.current = false
+      if (bargeinArmTimerRef.current !== null) {
+        window.clearTimeout(bargeinArmTimerRef.current)
+        bargeinArmTimerRef.current = null
+      }
+    }
+  }, [assistantSpeaking])
 
   const lastFaceSeenRef = useRef<number>(0)
   useEffect(() => {
@@ -40,10 +73,9 @@ export function VadListener() {
 
   const shouldListen = useCallback((): boolean => {
     if (!wsReady) return false
-    // Keep the mic off both while Pointer is speaking AND while the backend is
-    // still composing the reply. Without the assistantBusy check the VAD could
-    // re-fire during the think window and Pointer would answer twice.
-    if (assistantSpeaking || assistantBusy) return false
+    // Keep mic active at all times (including during search/LLM wait) so the
+    // user can speak and trigger light-chat while Pointer is thinking.
+    // Barge-in during TTS playback is handled in onSpeechStart via interruptAssistant().
     if (facePresent) return true
     if (
       lastFaceSeenRef.current > 0 &&
@@ -53,7 +85,7 @@ export function VadListener() {
     }
     if (awaitingName) return true
     return false
-  }, [wsReady, assistantSpeaking, assistantBusy, facePresent, awaitingName])
+  }, [wsReady, facePresent, awaitingName])
 
   useEffect(() => {
     let disposed = false
@@ -86,10 +118,25 @@ export function VadListener() {
           negativeSpeechThreshold: 0.4,
           onSpeechStart: () => {
             if (disposed) return
+            if (assistantSpeakingRef.current) {
+              if (!bargeinArmedRef.current) {
+                // Too early — echo before cancellation adapted; ignore segment
+                echoTriggerRef.current = true
+                return
+              }
+              echoTriggerRef.current = false
+              interruptRef.current()
+            } else {
+              echoTriggerRef.current = false
+            }
             setState('speaking')
           },
           onSpeechEnd: async (audio) => {
             if (disposed) return
+            if (echoTriggerRef.current) {
+              echoTriggerRef.current = false
+              return  // drop echo audio — state is already 'listening'
+            }
             setState('sending')
             const wavBytes = encodeWav(audio, VAD_SAMPLE_RATE)
             const blob = new Blob([wavBytes], { type: 'audio/wav' })
@@ -122,6 +169,10 @@ export function VadListener() {
 
     return () => {
       disposed = true
+      if (bargeinArmTimerRef.current !== null) {
+        window.clearTimeout(bargeinArmTimerRef.current)
+        bargeinArmTimerRef.current = null
+      }
       if (localVad) {
         void localVad.destroy().catch(() => {})
       }

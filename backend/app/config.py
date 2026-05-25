@@ -55,9 +55,13 @@ class Settings(BaseSettings):
 
     # Model selection
     llm_model: str = "llama-3.3-70b-versatile"
+    # Dedicated fast model for light chat — uses NVIDIA NIM (llama-3.1-70b ~3s, stabil)
+    light_chat_model: str = "meta/llama-3.1-70b-instruct"
     stt_model: str = "whisper-large-v3-turbo"
-    embedding_model: str = "voyage-multilingual-2"
+    embedding_model: str = "nvidia/nv-embedqa-e5-v5"
     tts_voice_default: str = "id-ID-GadisNeural"
+    # Hard timeout (seconds) applied to search_task after the filler loop exits
+    search_timeout_s: float = 2.0
 
     # Server
     host: str = "127.0.0.1"

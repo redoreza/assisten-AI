@@ -261,7 +261,10 @@ class TTSWithFallback:
                     f"TTSWithFallback: Azure key[{idx}] failed → {next_label} "
                     f"(will retry in {_AZURE_COOLDOWN_S:.0f}s): {exc}"
                 )
-        return await self._edge.synthesize(text, **kwargs)
+        # Azure HD / Multilingual voices don't exist in Edge TTS — strip the
+        # voice kwarg so Edge uses its own default rather than failing.
+        edge_kwargs = {k: v for k, v in kwargs.items() if k != "voice"}
+        return await self._edge.synthesize(text, **edge_kwargs)
 
 
 _tts_with_fallback: TTSWithFallback | None = None

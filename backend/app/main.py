@@ -6,6 +6,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from contextlib import asynccontextmanager
 
@@ -15,9 +16,11 @@ from loguru import logger
 
 from app.api.chat import router as chat_router
 from app.api.face import router as face_router
+from app.api.knowledge import router as kb_router
 from app.api.websocket import router as ws_router
 from app.config import settings
 from app.core.persona import persona_manager
+from app.services.face_recognition import get_face_recognition
 
 
 def _configure_logging() -> None:
@@ -30,6 +33,14 @@ def _configure_logging() -> None:
     )
 
 
+async def _warmup_face() -> None:
+    try:
+        result = await get_face_recognition().warmup()
+        logger.info(f"Face recognition ready — {result}")
+    except Exception as exc:
+        logger.warning(f"Face warmup failed (will retry on first browser request): {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _configure_logging()
@@ -37,6 +48,7 @@ async def lifespan(app: FastAPI):
     persona_manager.load_all()
     if not settings.groq_api_key:
         logger.warning("GROQ_API_KEY is empty — /api/chat will return 500 until you set it in .env")
+    asyncio.create_task(_warmup_face())
     yield
     logger.info("Shutting down")
 
@@ -58,6 +70,7 @@ app.add_middleware(
 
 app.include_router(chat_router, prefix="/api")
 app.include_router(face_router, prefix="/api")
+app.include_router(kb_router)
 app.include_router(ws_router)
 
 

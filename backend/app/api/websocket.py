@@ -19,6 +19,7 @@ Server → Client: see orchestrator event types.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import time
@@ -27,18 +28,15 @@ from typing import Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from loguru import logger
 
+from app.agents.correction_detection_agent import get_correction_detection_agent
+from app.agents.face_engagement_agent import get_face_engagement_agent
+from app.agents.name_extraction_agent import get_name_extraction_agent
+from app.agents.stt_agent import get_stt_agent
 from app.config import settings
 from app.core.orchestrator import SessionState, get_orchestrator
-from app.services.chat_history import get_chat_history
 from app.services.face_recognition import get_face_recognition
 
 router = APIRouter()
-
-# How long an unknown face must remain visible before we ask their name —
-# prevents reacting to brief glances or people walking past.
-UNKNOWN_STABLE_SECONDS = 3.0
-# Debounce on any face-driven speech — avoid firing two greetings in quick succession
-FACE_ACTION_COOLDOWN_S = 5.0
 
 
 async def _dispatch_orchestrator(ws: WebSocket, iterator) -> None:
@@ -65,6 +63,25 @@ async def voice_ws(ws: WebSocket) -> None:
     client = f"{ws.client.host}:{ws.client.port}" if ws.client else "?"
     logger.info(f"WS connect from {client}")
 
+    pipeline_task: asyncio.Task | None = None
+
+    def cancel_pipeline() -> None:
+        nonlocal pipeline_task
+        if pipeline_task and not pipeline_task.done():
+            pipeline_task.cancel()
+        pipeline_task = None
+        session.pipeline_busy = False
+
+    async def run_pipeline(text: str) -> None:
+        session.pipeline_busy = True
+        try:
+            await handle_user_input(text)
+        except asyncio.CancelledError:
+            logger.info("[WS] pipeline cancelled (barge-in)")
+            raise
+        finally:
+            session.pipeline_busy = False
+
     async def handle_user_input(text: str) -> None:
         """Route user text/audio: if we're awaiting a name, treat it as the name
         and run enrollment. Otherwise normal chat."""
@@ -74,7 +91,7 @@ async def voice_ws(ws: WebSocket) -> None:
             session.awaiting_name = False
             session.pending_enroll_image_b64 = None
             logger.info(f"[face] extracting name from: '{text[:80]}'")
-            extracted = await orch.extract_name(text)
+            extracted = await get_name_extraction_agent().run(text)
             if not extracted:
                 logger.info("[face] no name extracted; falling back to chat")
                 await _dispatch_orchestrator(ws, orch.handle_text(session, text))
@@ -123,7 +140,7 @@ async def voice_ws(ws: WebSocket) -> None:
             and session.last_engaged_name
             and session.last_known_face_image_b64
         ):
-            new_name = await orch.detect_correction(text, session.last_engaged_name)
+            new_name = await get_correction_detection_agent().run(text, session.last_engaged_name)
             logger.info(
                 f"[face] correction LLM returned: {new_name!r} "
                 f"(current: {session.last_engaged_name!r})"
@@ -211,13 +228,11 @@ async def voice_ws(ws: WebSocket) -> None:
                 # Previously normal-chat audio bypassed handle_user_input and so
                 # name corrections spoken via mic were never detected.
                 stt_t0 = time.monotonic()
-                from app.core.orchestrator import _stt_bias_prompt
                 try:
-                    transcript = await orch._stt.transcribe(  # type: ignore[attr-defined]
+                    transcript = await get_stt_agent().transcribe(
                         audio_bytes,
                         format=audio_format,
-                        language="id",
-                        prompt=_stt_bias_prompt(session),
+                        session=session,
                     )
                 except Exception as exc:
                     logger.exception("STT failed")
@@ -230,7 +245,13 @@ async def voice_ws(ws: WebSocket) -> None:
                     {"type": "transcript", "text": transcript, "latency_ms": stt_ms}
                 )
                 if transcript.strip():
-                    await handle_user_input(transcript)
+                    if pipeline_task and not pipeline_task.done():
+                        # Pipeline busy — queue as light chat instead of barge-in
+                        session.pending_light_chat_queue.append(transcript)
+                        logger.info(f"[WS] light chat queued (audio): '{transcript[:80]}'")
+                    else:
+                        cancel_pipeline()
+                        pipeline_task = asyncio.create_task(run_pipeline(transcript))
                 else:
                     await ws.send_json({"type": "done", "reason": "empty_transcript"})
 
@@ -240,10 +261,21 @@ async def voice_ws(ws: WebSocket) -> None:
                     await ws.send_json({"type": "error", "message": "text.message required"})
                     continue
                 logger.info(f"WS text: '{message[:80]}'")
-                await handle_user_input(message)
+                if pipeline_task and not pipeline_task.done():
+                    # Main pipeline is busy — queue as light chat instead of barge-in.
+                    # Use the 'interrupt' message type to force a barge-in when needed.
+                    session.pending_light_chat_queue.append(message)
+                    logger.info(f"[WS] light chat queued: '{message[:80]}'")
+                else:
+                    cancel_pipeline()
+                    pipeline_task = asyncio.create_task(run_pipeline(message))
+
+            elif mtype == "interrupt":
+                cancel_pipeline()
+                logger.info("[WS] interrupt received")
 
             elif mtype == "face_present":
-                await _handle_face_present(ws, session, orch, msg)
+                await get_face_engagement_agent().handle(ws, session, orch, msg)
 
             elif mtype == "face_lost":
                 if session.engaged_person_id is not None or session.awaiting_name:
@@ -273,91 +305,20 @@ async def voice_ws(ws: WebSocket) -> None:
                 session.greeted_person_ids.clear()
                 session.reset_face()
                 audio_buf.clear()
+                session.light_chat_history.clear()
+                session.pending_light_chat_queue.clear()
                 await ws.send_json({"type": "ack", "field": "history", "value": "cleared"})
 
             else:
                 await ws.send_json({"type": "error", "message": f"unknown type: {mtype}"})
 
     except WebSocketDisconnect:
+        cancel_pipeline()
         logger.info(f"WS disconnect from {client}")
     except Exception:
+        cancel_pipeline()
         logger.exception("WS handler crashed")
         try:
             await ws.close(code=1011)
         except Exception:
             pass
-
-
-async def _handle_face_present(
-    ws: WebSocket,
-    session: SessionState,
-    orch,
-    msg: dict[str, Any],
-) -> None:
-    """Drive the face engagement state machine from one face_present event."""
-    if session.awaiting_name:
-        return  # already asked; wait for user's response
-
-    match_name = msg.get("match_name")
-    match_person_id = msg.get("match_person_id")
-    image_b64 = msg.get("image_base64")
-    now = time.monotonic()
-
-    # ── Known face ───────────────────────────────────────────────────────────
-    if match_person_id is not None and isinstance(match_name, str):
-        session.unknown_first_seen_at = None
-        # Always keep the freshest face image cached — needed if the user
-        # later says their name is wrong and we re-enroll under a new name.
-        if isinstance(image_b64, str) and image_b64:
-            session.last_known_face_image_b64 = image_b64
-        session.last_engaged_name = match_name
-        # Always restore engagement on every known-face frame; without this, a
-        # face_lost → re-entry sequence would leave engaged_person_id=None and
-        # break the correction flow even though greeted_person_ids still holds
-        # the person.
-        session.engaged_person_id = match_person_id
-        if match_person_id in session.greeted_person_ids:
-            return  # already greeted this session — don't re-greet
-        if now - session.last_face_action_at < FACE_ACTION_COOLDOWN_S:
-            return
-        # Hydrate cross-session memory: pull this person's last N turns from
-        # disk so Pointer can reference what they talked about previously.
-        # Replace any in-memory history (which would be either empty or from
-        # a different person on the same WS connection).
-        try:
-            past = await get_chat_history().recent(match_person_id, max_turns=12)
-            if past:
-                session.history = [
-                    {"role": role, "content": content} for role, content, _ in past
-                ]
-                logger.info(
-                    f"[face] hydrated {len(past)} past turns for "
-                    f"person_id={match_person_id} ({match_name})"
-                )
-            else:
-                session.history = []
-        except Exception as exc:
-            logger.warning(f"chat_history hydrate failed: {exc}")
-        session.greeted_person_ids.add(match_person_id)
-        session.last_face_action_at = now
-        await _dispatch_orchestrator(ws, orch.greet_known(session, match_name))
-        return
-
-    # ── Unknown face ─────────────────────────────────────────────────────────
-    if not isinstance(image_b64, str) or not image_b64:
-        return
-    if session.unknown_first_seen_at is None:
-        session.unknown_first_seen_at = now
-        logger.debug(f"[face] unknown face first seen at {now:.1f}")
-        return
-    elapsed = now - session.unknown_first_seen_at
-    if elapsed < UNKNOWN_STABLE_SECONDS:
-        return
-    if now - session.last_face_action_at < FACE_ACTION_COOLDOWN_S:
-        return
-    session.pending_enroll_image_b64 = image_b64
-    session.awaiting_name = True
-    session.last_face_action_at = now
-    logger.info(f"[face] unknown stable for {elapsed:.1f}s, asking for name")
-    await ws.send_json({"type": "face_awaiting_name"})
-    await _dispatch_orchestrator(ws, orch.ask_name(session))

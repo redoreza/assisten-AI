@@ -18,167 +18,61 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import re
+import random
 import time
+from collections import deque
 from collections.abc import AsyncIterator
-from datetime import datetime
 from typing import Any, Literal
-from zoneinfo import ZoneInfo
 
 from loguru import logger
 
 from app.config import settings
 from app.core.persona import Persona, persona_manager
 from app.core.viseme import boundaries_to_visemes
+from app.agents.context_builder_agent import get_context_builder_agent
+from app.agents.history_hydration_agent import HistoryHydrationAgent
+from app.agents.light_chat_agent import get_light_chat_agent
+from app.agents.llm_stream_agent import get_llm_stream_agent
+from app.agents.search_agent import SearchAgent, SearchResult
+from app.agents.speech_prep_agent import get_speech_prep_agent
+from app.agents.stt_agent import get_stt_agent
 from app.services.chat_history import get_chat_history
 from app.services.llm_groq import ChatMessage, get_llm
-from app.services.search_tavily import get_search
-from app.services.stt_groq import get_stt
 from app.services.tts_edge import get_tts
-
-# Tool schema for OpenAI/Groq function calling. Description is the LLM's guide
-# for WHEN to call this — phrasing matters a lot for trigger accuracy.
-SEARCH_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "search_web",
-        "description": (
-            "Cari informasi terkini di internet. Gunakan HANYA kalau pertanyaan "
-            "user butuh info aktual yang kamu tidak tahu pasti — misalnya: berita "
-            "hari ini, kurs / harga, cuaca, hasil pertandingan, info publik tentang "
-            "tokoh/tempat/event, jadwal acara, atau fakta spesifik yang mungkin sudah "
-            "berubah. JANGAN panggil tool ini untuk obrolan biasa, sapaan, atau "
-            "pertanyaan yang bisa kamu jawab dari pengetahuan umum."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Kata kunci pencarian yang ringkas (bahasa Indonesia atau Inggris)",
-                }
-            },
-            "required": ["query"],
-        },
-    },
-}
 
 Mode = Literal["companion", "customer_service"]
 
-_SENTENCE_END = re.compile(r"([\.!\?…]+)(\s|$)")
+# Phrases Pointer speaks the moment a web search is triggered — user hears an
+# immediate acknowledgement instead of silence while search+TTS spin up.
+_SEARCH_PHRASES = (
+    "Oke, tunggu sebentar ya, aku coba cari dulu.",
+    "Hmm, biar aku cek dulu infonya ya.",
+    "Sebentar ya, aku cari dulu.",
+    "Boleh aku cek sebentar? Satu momen ya.",
+    "Oke, aku cari dulu, tunggu ya.",
+    "Wah menarik nih! Bentar, aku googling dulu.",
+    "Hmm, aku kurang hafal detailnya — cek dulu ya.",
+    "Satu momen ya, biar aku pastiin dulu infonya.",
+    "Bentar, aku cari info yang akurat dulu biar nggak salah.",
+    "Oh menarik! Aku lihat dulu supaya jawabannya tepat ya.",
+    "Sabar ya, aku cek dulu biar beneran akurat nih.",
+    "Hmm, biar aku cari yang terkini — tunggu sebentar ya.",
+)
 
-# Bias prompt for Whisper STT — gives the model context so it leans toward
-# Indonesian campus-conversation vocabulary instead of guessing English words.
-# Including a few words the user is likely to say also reduces misheard names.
-_STT_BIAS_BASE = (
-    "Percakapan santai antara user dengan asisten virtual kampus bernama Pointer. "
-    "Bahasa Indonesia sehari-hari, kadang mahasiswa, dosen, kelas, jadwal, kampus, "
-    "ruang kuliah, fakultas, prodi."
+# Short filler phrases Pointer speaks if the search is still running after the
+# initial hold-on phrase plays out. Keeps conversation alive during slow searches.
+_SEARCH_FILLER_PHRASES = (
+    "Hampir ketemu nih, bentar lagi.",
+    "Lagi aku baca hasilnya...",
+    "Wah banyak infonya, aku ambil yang paling relevan ya.",
+    "Dikit lagi ya, hampir selesai nih.",
+    "Hmm, aku sortir dulu biar jawabannya pas.",
 )
 
 
-def _stt_bias_prompt(session: SessionState) -> str:
-    """Build a per-session Whisper prompt. Include the engaged person's name so
-    STT can recognize it when they introduce themselves or mention themselves."""
-    if session.last_engaged_name:
-        return _STT_BIAS_BASE + f" Nama lawan bicara: {session.last_engaged_name}."
-    return _STT_BIAS_BASE
+def _pick_search_phrase() -> str:
+    return random.choice(_SEARCH_PHRASES)
 
-
-# Llama 3.3 on Groq occasionally emits tool calls as text content instead of
-# using the structured `tool_calls` field. We detect a few known patterns and
-# synthesize a tool call so the orchestrator can still execute it.
-_INLINE_TOOL_PATTERNS = [
-    # <function=NAME>{"args":...}</function>
-    re.compile(r"<function=(\w+)>(\{.*?\})</function>", re.DOTALL),
-    # <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-    re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL),
-]
-
-
-def _parse_inline_tool_calls(content: str) -> list[dict[str, Any]]:
-    """Pull tool calls out of a Llama text response. Returns the same shape as
-    the structured tool_calls path: [{id, name, arguments}, ...]"""
-    out: list[dict[str, Any]] = []
-    for i, m in enumerate(_INLINE_TOOL_PATTERNS[0].finditer(content)):
-        out.append({"id": f"inline_{i}", "name": m.group(1), "arguments": m.group(2)})
-    if out:
-        return out
-    for i, m in enumerate(_INLINE_TOOL_PATTERNS[1].finditer(content)):
-        try:
-            import json as _json
-
-            obj = _json.loads(m.group(1))
-            name = obj.get("name") or obj.get("function")
-            args = obj.get("arguments") or obj.get("parameters") or {}
-            if name:
-                arg_str = args if isinstance(args, str) else _json.dumps(args)
-                out.append({"id": f"inline_{i}", "name": name, "arguments": arg_str})
-        except Exception:
-            continue
-    return out
-
-
-def _strip_tool_markup(text: str) -> str:
-    """Remove any leftover tool-call markup from text that may end up in TTS."""
-    s = text
-    for pat in _INLINE_TOOL_PATTERNS:
-        s = pat.sub("", s)
-    # Also strip Llama's special tokens that occasionally leak through
-    s = re.sub(r"<\|python_tag\|>|<\|eom_id\|>|<\|eot_id\|>", "", s)
-    return s.strip()
-
-
-_ID_DAYS = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
-
-# Cheap heuristic to decide whether to invoke the phonetic-respeller LLM call:
-# match English-typical letter clusters that virtually never appear in pure
-# Indonesian text. Saves a ~300ms LLM call on every plain-Indonesian sentence.
-_LIKELY_ENGLISH = re.compile(
-    r"\b("
-    r"the|of|and|in|on|with|for|is|are|to|by|from|"
-    r"machine|learning|deep|computer|vision|neural|network|model|object|"
-    r"detection|recognition|training|algorithm|programming|software|"
-    r"hardware|cloud|server|client|frontend|backend|database|api|interface|"
-    r"sign|design|system|prompt|token|stream|tool|search|engine|"
-    r"face|prompt|once|only|look|you|your|with|what|how|"
-    r"AI|ML|DL|CV|NLP|GPU|CPU|SDK|API|UI|UX|"
-    r"yolo|chatgpt|llama|whisper|edge[- ]?tts"
-    r")\b",
-    re.IGNORECASE,
-)
-
-# Formal Bahasa Indonesia markers — when present we run the naturalization LLM
-# call to rewrite the sentence into spoken style. Tuned to catch the most
-# common formal-writing patterns Llama emits despite our system prompt.
-_FORMAL_ID = re.compile(
-    r"\b("
-    r"tidak|saya|anda|akan|dapat|adalah|merupakan|"
-    r"sehingga|namun|tetapi|apabila|jika|maupun|"
-    r"sangat|sekali|sangatlah|sebagai|secara|"
-    r"sudah|belum|akan|telah|sedang|"
-    r"bagaimana|mengapa|seperti|sebagaimana|"
-    r"silakan|silahkan|terima\s+kasih|mohon"
-    r")\b",
-    re.IGNORECASE,
-)
-_ID_MONTHS = [
-    "", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
-    "Juli", "Agustus", "September", "Oktober", "November", "Desember",
-]
-
-
-def _now_indonesian() -> str:
-    """Return a human-readable Bahasa Indonesia datetime string for the
-    Asia/Jakarta (WIB) timezone — injected into the LLM system prompt so
-    Pointer can answer 'jam berapa?' / 'hari apa?' factually."""
-    try:
-        now = datetime.now(ZoneInfo("Asia/Jakarta"))
-    except Exception:
-        now = datetime.now()
-    day = _ID_DAYS[now.weekday()]
-    month = _ID_MONTHS[now.month]
-    return f"{day}, {now.day} {month} {now.year}, pukul {now:%H:%M} WIB"
 
 
 class SessionState:
@@ -211,6 +105,19 @@ class SessionState:
         # Name we last enrolled the engaged person under; used by the LLM
         # correction-intent prompt and to delete the old DB entry on rename.
         self.last_engaged_name: str | None = None
+        # Light chat: queue of messages received while main pipeline is busy.
+        # Processed one-by-one after each filler phrase in _yield_fillers_while_waiting.
+        self.pending_light_chat_queue: deque[str] = deque()
+        # Conversation history kept alive during one wait window so back-and-forth
+        # stays coherent. Cleared by orchestrator after the main answer is delivered.
+        self.light_chat_history: list[dict] = []
+        # Pipeline busy flag — set by websocket.py when a pipeline task is running.
+        # Used by face_engagement_agent to skip proactive probes while a turn is active.
+        self.pipeline_busy: bool = False
+        # Periodic expression check — last time mood was probed and the last mood seen.
+        # Initialised to 0 so the first face_present after greet_known starts the clock.
+        self.last_expression_check_at: float = 0.0
+        self.last_known_mood: str = "neutral"
 
     def append(self, role: str, content: str) -> None:
         self.history.append({"role": role, "content": content})
@@ -230,9 +137,23 @@ class SessionState:
 
 class Orchestrator:
     def __init__(self) -> None:
-        self._stt = get_stt()
+        self._stt_agent = get_stt_agent()
         self._llm = get_llm()
         self._tts = get_tts()
+        self._search_agent = SearchAgent(self._llm)
+        self._light_chat_agent = get_light_chat_agent()
+        self._hydration_agent = HistoryHydrationAgent()
+        self._speech_prep = get_speech_prep_agent()
+        self._llm_stream_agent = get_llm_stream_agent()
+
+    def _persist(self, person_id: int | None, role: str, content: str) -> None:
+        """Fire-and-forget chat history write — never blocks the streaming path."""
+        async def _write() -> None:
+            try:
+                await get_chat_history().append(person_id, role, content)
+            except Exception as exc:
+                logger.warning(f"chat_history append({role}) failed: {exc}")
+        asyncio.create_task(_write())
 
     async def handle_audio(
         self,
@@ -243,11 +164,10 @@ class Orchestrator:
     ) -> AsyncIterator[dict[str, Any]]:
         t0 = time.perf_counter()
         try:
-            transcript = await self._stt.transcribe(
+            transcript = await self._stt_agent.transcribe(
                 audio,
                 format=audio_format,
-                language="id",
-                prompt=_stt_bias_prompt(session),
+                session=session,
             )
         except Exception as exc:
             logger.exception("STT failed")
@@ -273,85 +193,113 @@ class Orchestrator:
         persona = persona_manager.get(session.persona_id)
 
         session.append("user", message)
-        # Persist user turn to disk (under engaged person if known; else NULL).
-        # Fire-and-forget would lose order guarantees — keep awaited but cheap.
-        try:
-            await get_chat_history().append(
-                session.engaged_person_id, "user", message
-            )
-        except Exception as exc:
-            logger.warning(f"chat_history append(user) failed: {exc}")
+        self._persist(session.engaged_person_id, "user", message)
 
-        # ── Search classifier (if Tavily configured) ────────────────────────
-        # Llama's tool-calling on Groq is unreliable — sometimes emits tool
-        # calls as text. We use a deterministic 2-stage approach instead:
-        # 1. Cheap classifier call: "does this need web search? reply SEARCH: <q> or NO"
-        # 2. If SEARCH: run Tavily, inject result as context, then stream normal answer
-        # 3. If NO: stream answer immediately
-        search_context: str | None = None
+        # ── Classify search need, then run search + hydration in parallel ──
+        # Hydration is a catch-up path: normally history is loaded when a face
+        # is first recognised. This branch handles the race where the user
+        # speaks before the face_present event fires.
+        needs_hydration = (
+            session.engaged_person_id is not None
+            and session.engaged_person_id not in session.greeted_person_ids
+        )
+
+        search_query: str | None = None
         if settings.tavily_api_key:
-            search_query = await self._classify_search_need(
-                message, history=session.history[:-1]  # exclude the just-added user msg
+            search_query = await self._search_agent.classify(
+                message, history=session.history[:-1]
             )
-            if search_query:
-                logger.info(f"[handle_text] classifier triggered search: {search_query!r}")
-                yield {"type": "tool_use", "tools": ["search_web"], "query": search_query}
+
+        search_result: SearchResult | None = None
+        hydrated_turns: list = []
+
+        if search_query:
+            # Kick off search + hydration as background tasks, then speak the
+            # hold-on phrase while they run — search latency is largely hidden
+            # behind the TTS playback time.
+            search_task = asyncio.create_task(
+                self._search_agent.run_with_query(search_query, message)
+            )
+            hydration_task = (
+                asyncio.create_task(self._hydration_agent.run(session.engaged_person_id))
+                if needs_hydration else None
+            )
+            # Only forward audio-production events from the hold-on phrase.
+            # Suppress terminal events so the frontend state machine doesn't
+            # think the turn is complete while search is still running.
+            async for ev in self.speak(session, _pick_search_phrase(), ephemeral=True):
+                ev_type = ev.get("type")
+                if ev_type in ("done", "timing"):
+                    continue
+                if ev_type == "ai_text" and ev.get("is_final"):
+                    continue
+                yield ev
+            # Speak filler phrases if search takes too long after the hold-on
+            # phrase finishes, then collect the result.
+            try:
+                async for ev in self._yield_fillers_while_waiting(session, search_task):
+                    yield ev
+                # Safety net: filler loop may exit while task is still running
                 try:
-                    result = await get_search().search_and_extract(search_query)
-                    search_context = result["llm_context"]
-                    logger.info(
-                        f"[handle_text] search 1 ({len(search_context)} chars, "
-                        f"{len(result['sources'])} sources)"
+                    search_result = await asyncio.wait_for(
+                        search_task, timeout=settings.search_timeout_s
                     )
+                except asyncio.TimeoutError:
+                    logger.warning("[handle_text] search_task hung, cancelling")
+                    search_task.cancel()
+                    search_result = None
+            except asyncio.CancelledError:
+                search_task.cancel()
+                if hydration_task is not None:
+                    hydration_task.cancel()
+                raise
+            if hydration_task is not None:
+                hydrated_turns = await hydration_task
+        elif needs_hydration:
+            hydrated_turns = await self._hydration_agent.run(session.engaged_person_id)
 
-                    # Agentic step: evaluate if the result is sufficient. If
-                    # not, do one (and only one) refined retry. Cap at 1 retry
-                    # to bound the worst-case latency.
-                    retry_query = await self._evaluate_search_sufficiency(
-                        message, search_context
-                    )
-                    if retry_query and retry_query != search_query:
-                        logger.info(f"[handle_text] retry search with: {retry_query!r}")
-                        yield {
-                            "type": "tool_use",
-                            "tools": ["search_web"],
-                            "query": retry_query,
-                        }
-                        retry_result = await get_search().search_and_extract(retry_query)
-                        if retry_result["sources"]:
-                            # Merge: prepend new context as primary, then original
-                            search_context = (
-                                retry_result["llm_context"]
-                                + "\n\n--- additional context from previous search ---\n"
-                                + search_context
-                            )
-                            # Merge sources (dedupe by URL)
-                            seen_urls = {s["url"] for s in retry_result["sources"]}
-                            for s in result["sources"]:
-                                if s["url"] not in seen_urls:
-                                    retry_result["sources"].append(s)
-                                    seen_urls.add(s["url"])
-                            result = retry_result
-                            search_query = retry_query
-                            logger.info(
-                                f"[handle_text] search 2 merged "
-                                f"({len(search_context)} chars, {len(result['sources'])} sources)"
-                            )
+        if hydrated_turns and session.engaged_person_id is not None:
+            # Prepend past turns before the current user message.
+            # Clamp to memory_max_turns * 2 so hydration can't overflow the cap.
+            current_msg = session.history[-1]
+            max_msgs = settings.memory_max_turns * 2
+            session.history = (hydrated_turns + [current_msg])[-max_msgs:]
+            session.greeted_person_ids.add(session.engaged_person_id)
+            logger.info(
+                f"[handle_text] catch-up hydrated {len(hydrated_turns)} turns "
+                f"for person_id={session.engaged_person_id}"
+            )
 
-                    if result["sources"]:
-                        yield {
-                            "type": "search_sources",
-                            "query": search_query,
-                            "sources": result["sources"],
-                        }
-                except Exception as exc:
-                    logger.warning(f"search failed: {exc}")
-                    search_context = None
+        search_context: str | None = None
+        if search_result:
+            for ev in search_result["ws_events"]:
+                yield ev
+            search_context = search_result["context"]
 
-        messages = self._build_messages_with_session(persona, session)
+        # ── Knowledge base retrieval (NVIDIA NIM RAG) ───────────────────────
+        # Runs only when NVIDIA_API_KEY is set and the KB has documents indexed.
+        kb_context: str | None = None
+        if settings.nvidia_api_key:
+            try:
+                from app.services.knowledge_base import get_knowledge_base
+                kb_context = await get_knowledge_base().build_context(message)
+            except Exception as exc:
+                logger.debug(f"[KB] query skipped: {exc}")
+
+        messages = get_context_builder_agent().build_with_session(persona, session)
+        if kb_context:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Informasi relevan dari knowledge base Pointer:\n\n"
+                        f"{kb_context}\n\n"
+                        "Gunakan informasi ini jika relevan dengan pertanyaan user. "
+                        "Jika tidak relevan, abaikan dan jawab dari pengetahuanmu sendiri."
+                    ),
+                }
+            )
         if search_context:
-            # Inject search context as a system addendum, immediately before
-            # the user's message in the LLM's view.
             messages.append(
                 {
                     "role": "system",
@@ -359,402 +307,124 @@ class Orchestrator:
                         f"Hasil pencarian web untuk pertanyaan user:\n\n{search_context}\n\n"
                         "Gunakan info di atas untuk jawab pertanyaan user secara ringkas dan natural "
                         "dalam bahasa Indonesia. JANGAN tempel URL/link mentah-mentah ke jawaban suara. "
-                        "Kalau hasil kurang relevan, bilang saja kamu tidak yakin."
+                        "Kalau hasil kurang relevan, bilang saja kamu tidak yakin.\n\n"
+                        "PENTING: kamu tadi sudah bilang ke user bahwa kamu sedang mencari. "
+                        "Awali jawabanmu dengan kalimat natural singkat yang menandakan kamu sudah "
+                        "selesai mencari — misalnya 'Oke, udah dapat nih—', 'Nah ini yang aku "
+                        "temukan—', atau 'Sudah ketemu, jadi—'. Lanjutkan langsung ke isi jawaban."
                     ),
                 }
             )
 
-        first_token_ms: int | None = None
-        first_audio_ms: int | None = None
-        sentence_idx = 0
-        audio_seq = 0
-        buffer = ""
-        full_reply = ""
+        # Drain light-chat queue before LLM stream starts.
+        # Covers: (1) fast search that exits filler loop before any filler fires,
+        # (2) non-search path that never enters the filler loop at all.
+        async for ev in self.handle_light_chat_if_pending(session):
+            yield ev
 
-        async def flush_sentence(sentence: str, idx: int, seq: int) -> dict[str, Any]:
-            nonlocal first_audio_ms
-            tts_t0 = time.perf_counter()
-            spoken = await self._prepare_for_speech(sentence)
-            if spoken != sentence:
-                logger.debug(f"[speech-prep] {sentence[:60]!r} -> {spoken[:60]!r}")
-            result = await self._tts.synthesize(
-                spoken,
-                voice=persona.voice.voice_id,
-                rate=persona.voice.rate,
-                pitch=persona.voice.pitch,
-            )
-            tts_ms = int((time.perf_counter() - tts_t0) * 1000)
-            if first_audio_ms is None:
-                first_audio_ms = int((time.perf_counter() - t0) * 1000)
-            visemes = boundaries_to_visemes(result["word_boundaries"])
-            return {
-                "audio_event": {
-                    "type": "audio",
-                    "data": base64.b64encode(result["audio"]).decode("ascii"),
-                    "format": "mp3",
-                    "sequence": seq,
-                    "sentence_idx": idx,
-                    "tts_ms": tts_ms,
-                },
-                "viseme_event": {
-                    "type": "viseme",
-                    "events": visemes,
-                    "audio_seq": seq,
-                },
-            }
+        async for ev in self._llm_stream_agent.run(messages, persona, t0):
+            if ev.get("type") == "done":
+                full_reply = ev.get("full_reply", "")
+                if full_reply:
+                    session.append("assistant", full_reply)
+                    self._persist(session.engaged_person_id, "assistant", full_reply)
+                # Main answer delivered — reset light chat state for next turn
+                session.light_chat_history.clear()
+                session.pending_light_chat_queue.clear()
+                yield {"type": "done"}
+            else:
+                yield ev
 
-        pending_tts: list[asyncio.Task[dict[str, Any]]] = []
+    async def handle_light_chat_if_pending(
+        self,
+        session: SessionState,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Process all queued light-chat messages, generating a brief reply for each.
 
-        try:
-            # Lower temperature (0.5) for more deterministic, on-character replies
-            # — defaults tended toward 0.7 which gave too much creative drift.
-            async for chunk in self._llm.generate_stream(messages, temperature=0.5):
-                if first_token_ms is None:
-                    first_token_ms = int((time.perf_counter() - t0) * 1000)
-                buffer += chunk
-                full_reply += chunk
-                while True:
-                    match = _SENTENCE_END.search(buffer)
-                    if not match:
-                        break
-                    end = match.end()
-                    sentence = buffer[:end].strip()
-                    buffer = buffer[end:]
-                    if not sentence:
-                        continue
-                    yield {
-                        "type": "ai_text",
-                        "text": sentence,
-                        "is_final": False,
-                        "sentence_idx": sentence_idx,
-                    }
-                    pending_tts.append(
-                        asyncio.create_task(
-                            flush_sentence(sentence, sentence_idx, audio_seq)
-                        )
-                    )
-                    sentence_idx += 1
-                    audio_seq += 1
-        except Exception as exc:
-            logger.exception("LLM stream failed")
-            yield {"type": "error", "message": f"LLM failed: {exc}"}
+        Called between filler phrases so users are acknowledged while the main
+        search/pipeline runs in the background. Maintains conversation history
+        within the wait window so back-and-forth feels natural. Replies are
+        ephemeral — not added to the main conversation history.
+        """
+        if not session.pending_light_chat_queue:
             return
 
-        tail = buffer.strip()
-        if tail:
-            yield {
-                "type": "ai_text",
-                "text": tail,
-                "is_final": False,
-                "sentence_idx": sentence_idx,
-            }
-            pending_tts.append(
-                asyncio.create_task(flush_sentence(tail, sentence_idx, audio_seq))
+        # Main question being processed (last user turn in main history)
+        main_question: str | None = None
+        for turn in reversed(session.history):
+            if turn.get("role") == "user":
+                main_question = turn.get("content") or None
+                break
+
+        # Offset sequences so light-chat audio never collides with the main
+        # pipeline's 0-based sequence counter (viseme buffer key conflicts
+        # cause wrong lip-sync).
+        SEQ_OFFSET = 10_000
+        lc_idx = 0
+        while session.pending_light_chat_queue:
+            message = session.pending_light_chat_queue.popleft()
+            reply = await self._light_chat_agent.generate(
+                message, main_question, session.light_chat_history
             )
-            sentence_idx += 1
-
-        for task in pending_tts:
-            try:
-                payload = await task
-            except Exception as exc:
-                logger.exception("TTS task failed")
-                yield {"type": "error", "message": f"TTS failed: {exc}"}
-                continue
-            # Emit viseme first so the client has lip-sync data ready BEFORE
-            # the audio element starts playing — otherwise the first 100ms of
-            # speech happens with no mouth movement.
-            yield payload["viseme_event"]
-            yield payload["audio_event"]
-
-        if full_reply.strip():
-            final_text = full_reply.strip()
-            session.append("assistant", final_text)
-            try:
-                await get_chat_history().append(
-                    session.engaged_person_id, "assistant", final_text
-                )
-            except Exception as exc:
-                logger.warning(f"chat_history append(assistant) failed: {exc}")
-
-        total_ms = int((time.perf_counter() - t0) * 1000)
-        yield {
-            "type": "ai_text",
-            "text": full_reply.strip(),
-            "is_final": True,
-            "sentence_idx": sentence_idx,
-        }
-        yield {
-            "type": "timing",
-            "first_token_ms": first_token_ms,
-            "first_audio_ms": first_audio_ms,
-            "total_ms": total_ms,
-            "sentences": sentence_idx,
-        }
-        yield {"type": "done"}
-
-    def _build_messages(
-        self, persona: Persona, history: list[ChatMessage]
-    ) -> list[ChatMessage]:
-        system: ChatMessage = {"role": "system", "content": persona.render_system_prompt()}
-        return [system, *history[-(settings.memory_max_turns * 2) :]]
-
-    async def _prepare_for_speech(self, text: str) -> str:
-        """Naturalize formal Bahasa Indonesia into spoken style AND respell
-        English words phonetically for Indonesian TTS — both in one LLM call to
-        keep latency manageable.
-
-        Triggered when the input contains either English markers OR formal
-        Indonesian markers. Plain casual Indonesian passes through untouched.
-
-        Adds ~200-400ms but only when needed.
-        """
-        if not text:
-            return text
-        has_english = bool(_LIKELY_ENGLISH.search(text))
-        has_formal = bool(_FORMAL_ID.search(text))
-        if not (has_english or has_formal):
-            return text  # already casual + Indonesian-only — nothing to do
-
-        messages: list[ChatMessage] = [
-            {
-                "role": "system",
-                "content": (
-                    "Kamu adalah editor teks untuk text-to-speech Bahasa Indonesia. "
-                    "Tugasmu: rewrite teks input agar terdengar NATURAL diucapkan, dengan DUA langkah:\n\n"
-                    "1. NATURALISASI: ubah kata/struktur tulis-formal menjadi gaya LISAN sehari-hari.\n"
-                    "   - 'tidak' -> 'nggak' atau 'gak'\n"
-                    "   - 'saya' -> 'aku' (kecuali konteks sangat formal)\n"
-                    "   - 'apabila' / 'jika' -> 'kalau'\n"
-                    "   - 'bagaimana' -> 'gimana'\n"
-                    "   - 'sudah' -> 'udah'\n"
-                    "   - 'akan' -> 'bakal' atau dihilangkan\n"
-                    "   - 'merupakan' -> 'adalah' atau dihilangkan ('X merupakan Y' -> 'X itu Y')\n"
-                    "   - 'sehingga' -> 'jadi'\n"
-                    "   - 'namun' -> 'tapi'\n"
-                    "   - 'tetapi' -> 'tapi'\n"
-                    "   - 'sangat' -> 'banget' (di akhir frasa) atau dihilangkan\n"
-                    "   - Pecah kalimat panjang jadi 2-3 kalimat pendek kalau perlu, biar mengalir.\n"
-                    "   - JANGAN menambah informasi baru. JANGAN menghilangkan fakta penting.\n"
-                    "   - Pertahankan nama orang, tempat, istilah teknis.\n\n"
-                    "2. RESPELL INGGRIS: kata Inggris diubah ke ejaan fonetik Indonesia "
-                    "supaya pembaca Indonesia mengucapkannya seperti bunyi Inggris aslinya.\n"
-                    "   - 'machine learning' -> 'masyin lerning'\n"
-                    "   - 'You Only Look Once' -> 'Yu Onli Luk Wans'\n"
-                    "   - 'deep learning' -> 'diip lerning'\n"
-                    "   - 'object detection' -> 'obyek diteksyen'\n"
-                    "   - 'computer vision' -> 'kompyuter visyen'\n"
-                    "   - 'AI' -> 'ei ai', 'API' -> 'ei pi ai'\n"
-                    "   - Nama produk/orang (Pointer, YOLO, Polinela) -> biarkan apa adanya.\n\n"
-                    "OUTPUT: HANYA teks hasil rewrite, tanpa penjelasan, tanpa label, tanpa tanda kutip.\n\n"
-                    "Contoh lengkap:\n"
-                    "INPUT: 'Saya akan menjelaskan apa itu machine learning. Machine learning merupakan teknik yang sangat populer.'\n"
-                    "OUTPUT: 'Aku jelasin ya apa itu masyin lerning. Masyin lerning itu teknik yang lagi populer banget.'\n\n"
-                    "INPUT: 'Apabila kamu tidak mengerti, silakan bertanya kembali.'\n"
-                    "OUTPUT: 'Kalau kamu nggak ngerti, tanya aja lagi.'\n\n"
-                    "INPUT: 'aku suka kopi'\n"
-                    "OUTPUT: 'aku suka kopi'  (sudah natural, biarkan)"
-                ),
-            },
-            {"role": "user", "content": text},
-        ]
-        try:
-            raw = await self._llm.generate(messages, temperature=0.2, max_tokens=400)
-        except Exception as exc:
-            logger.warning(f"_prepare_for_speech failed, using original text: {exc}")
-            return text
-        out = raw.strip().strip("\"'")
-        if not out:
-            return text
-        return out
-
-    async def _evaluate_search_sufficiency(
-        self, user_message: str, search_context: str
-    ) -> str | None:
-        """After an initial search, decide whether the result is enough to
-        answer the user. If not, return a refined follow-up query.
-
-        Return value:
-            None             → result is sufficient, proceed to answer
-            <query string>   → run another search with this refined query
-        """
-        # Skip eval for very long contexts (likely already comprehensive)
-        if len(search_context) > 8000:
-            return None
-        messages: list[ChatMessage] = [
-            {
-                "role": "system",
-                "content": (
-                    "Kamu adalah evaluator hasil pencarian web. Tugasmu:\n"
-                    "Lihat (a) pertanyaan user dan (b) hasil pencarian yang sudah ada.\n"
-                    "Tentukan: apakah hasil ini SUDAH CUKUP untuk menjawab user secara faktual?\n\n"
-                    "Jawab PERSIS satu baris, salah satu format:\n"
-                    "  OK\n"
-                    "  RETRY: <query baru>\n\n"
-                    "Pakai RETRY hanya kalau hasil:\n"
-                    "- Tidak ada/error/kosong\n"
-                    "- Topiknya berbeda dari pertanyaan user (off-target)\n"
-                    "- Cuma menyentuh permukaan, padahal user minta detail spesifik\n\n"
-                    "Pakai OK kalau hasil sudah memuat fakta yang user butuhkan, walau pendek.\n"
-                    "JANGAN RETRY hanya karena ingin info lebih banyak — hanya kalau hasil benar-benar tidak menjawab.\n"
-                    "Query RETRY harus SELF-CONTAINED dan spesifik."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"PERTANYAAN USER:\n{user_message}\n\n"
-                    f"HASIL PENCARIAN:\n{search_context[:6000]}"
-                ),
-            },
-        ]
-        try:
-            raw = await self._llm.generate(messages, temperature=0.0, max_tokens=64)
-        except Exception as exc:
-            logger.warning(f"_evaluate_search_sufficiency failed: {exc}")
-            return None
-        line = raw.strip().splitlines()[0].strip() if raw.strip() else ""
-        if line.upper().startswith("OK"):
-            return None
-        if not line.upper().startswith("RETRY"):
-            return None
-        after = line.split(":", 1)[1] if ":" in line else line.split(" ", 1)[1] if " " in line else ""
-        query = after.strip().strip('"').strip("'")
-        if not query or len(query) > 200:
-            return None
-        return query
-
-    async def _classify_search_need(
-        self, user_text: str, history: list[ChatMessage] | None = None
-    ) -> str | None:
-        """Ask the LLM whether this user message needs a web search.
-
-        Returns the search query string if yes, else None. Uses a tight
-        instruction format (output must be 'SEARCH: <query>' or 'NO') so we
-        don't have to deal with structured tool-calling on Llama (which is
-        flaky on Groq — sometimes the model emits the call as raw text).
-
-        When `history` is provided, the classifier sees the last few turns so
-        anaphoric/elliptical follow-ups ("sejarah-nya gimana?", "YOLO?") get
-        rewritten into self-contained queries like
-        "sejarah program studi sains data terapan Polinela".
-        """
-        if not user_text.strip():
-            return None
-
-        # Build a short context summary of the last ~4 turns
-        context_lines: list[str] = []
-        if history:
-            for turn in history[-4:]:
-                role = turn.get("role", "?")
-                content = (turn.get("content") or "").strip()
-                if not content:
+            base = SEQ_OFFSET + lc_idx * 100
+            lc_idx += 1
+            async for ev in self.speak(session, reply, ephemeral=True):
+                ev_type = ev.get("type")
+                if ev_type in ("done", "timing"):
                     continue
-                if len(content) > 200:
-                    content = content[:197] + "…"
-                speaker = "User" if role == "user" else "Pointer"
-                context_lines.append(f"{speaker}: {content}")
-        context_block = ""
-        if context_lines:
-            context_block = (
-                "\nKONTEKS PERCAKAPAN (jangan jawab ini, hanya untuk rewrite query):\n"
-                + "\n".join(context_lines)
-                + "\n"
-            )
+                # Let is_final:True flow through so the frontend can finalize
+                # the light-chat bubble and reset its ref for the main answer.
+                if ev_type == "audio":
+                    ev = {**ev, "sequence": ev["sequence"] + base}
+                elif ev_type == "viseme":
+                    ev = {**ev, "audio_seq": ev["audio_seq"] + base}
+                yield ev
 
-        messages: list[ChatMessage] = [
-            {
-                "role": "system",
-                "content": (
-                    "Tugasmu: tentukan apakah pesan user terakhir butuh pencarian web "
-                    "untuk dijawab dengan benar.\n"
-                    "Jawab PERSIS satu baris, salah satu format ini, tanpa apapun lain:\n"
-                    "  SEARCH: <query>\n"
-                    "  NO\n\n"
-                    "PENTING — query harus SELF-CONTAINED. Pakai konteks percakapan untuk:\n"
-                    "- Mengganti kata ganti ('itu', 'nya', 'tersebut') dengan subjek aslinya\n"
-                    "- Tambah nama institusi/lokasi yang sedang dibahas (mis. nama kampus)\n"
-                    "- Lengkapi follow-up: 'sejarahnya?' -> 'sejarah X' (X dari konteks)\n\n"
-                    "Pakai SEARCH untuk:\n"
-                    "- Pertanyaan tentang fakta aktual / terkini (berita, harga, cuaca, kurs)\n"
-                    "- Tokoh/organisasi/produk yang tidak umum diketahui\n"
-                    "- 'apa itu X' untuk istilah yang kamu tidak yakin\n"
-                    "- Event / jadwal / pengumuman publik\n"
-                    "- Pertanyaan 'siapa', 'kapan', 'di mana', 'berapa' yang butuh fakta\n"
-                    "- Detail spesifik institusi/program (jumlah prodi, tahun berdiri, dll)\n\n"
-                    "Pakai NO untuk:\n"
-                    "- Sapaan, basa-basi, chit-chat\n"
-                    "- Pertanyaan tentang dirimu/sifat/persona\n"
-                    "- Perintah perilaku ('panggil aku X', 'jangan begitu')\n"
-                    "- Pertanyaan umum yang bisa dijawab dari pengetahuan dasar\n"
-                    "- Klarifikasi pesan ('apa maksudmu?')\n\n"
-                    "Contoh:\n"
-                    "- 'halo apa kabar' -> NO\n"
-                    "- 'siapa presiden indonesia sekarang' -> SEARCH: presiden indonesia 2026\n"
-                    "- (Konteks: kampus Polinela) + 'jumlah prodi?' -> SEARCH: jumlah program studi Polinela Politeknik Negeri Lampung\n"
-                    "- (Konteks: prodi Sains Data Terapan Polinela) + 'sejarahnya?' -> SEARCH: sejarah program studi Sains Data Terapan Polinela\n"
-                    "- (Konteks: deteksi objek) + 'YOLO?' -> SEARCH: YOLO object detection model\n"
-                    "- 'jam berapa sekarang' -> NO\n"
-                    "- 'ganti namaku jadi reza' -> NO\n"
-                    "- 'apa maksudmu?' -> NO"
-                    + context_block
-                ),
-            },
-            {"role": "user", "content": user_text},
-        ]
-        try:
-            raw = await self._llm.generate(messages, temperature=0.0, max_tokens=48)
-        except Exception as exc:
-            logger.warning(f"_classify_search_need LLM failed: {exc}")
-            return None
-        line = raw.strip().splitlines()[0].strip() if raw.strip() else ""
-        if line.upper() == "NO" or line.upper().startswith("NO"):
-            return None
-        if not line.upper().startswith("SEARCH"):
-            return None
-        # Accept both 'SEARCH: <q>' and 'SEARCH <q>'
-        after = line.split(":", 1)[1] if ":" in line else line.split(" ", 1)[1] if " " in line else ""
-        query = after.strip().strip('"').strip("'")
-        if not query or len(query) > 200:
-            return None
-        return query
+    async def _yield_fillers_while_waiting(
+        self,
+        session: SessionState,
+        task: asyncio.Task,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Speak short filler phrases while `task` (search) is still running.
 
-    async def _execute_tool(self, name: str, args_json: str) -> str:
-        """Execute a tool call from the LLM. Returns text the LLM will see next."""
-        import json
+        Uses asyncio.shield so the original task is never cancelled by the
+        wait_for timeout. Yields audio/viseme events just like the hold-on
+        phrase, suppressing terminal events from each filler speak().
 
-        try:
-            args = json.loads(args_json) if args_json else {}
-        except json.JSONDecodeError as exc:
-            return f"TOOL_ERROR: invalid arguments JSON: {exc}"
-
-        if name == "search_web":
-            query = args.get("query", "").strip()
-            if not query:
-                return "TOOL_ERROR: missing query"
+        After each filler, any pending light-chat message is handled so the
+        user feels heard while the search runs in the background.
+        """
+        fillers = list(_SEARCH_FILLER_PHRASES)
+        random.shuffle(fillers)
+        idx = 0
+        while not task.done():
             try:
-                return await get_search().search(query)
-            except Exception as exc:
-                logger.exception(f"search_web tool failed: {exc}")
-                return f"TOOL_ERROR: {exc}"
-
-        return f"TOOL_ERROR: unknown tool '{name}'"
-
-    def _build_messages_with_session(
-        self, persona: Persona, session: SessionState
-    ) -> list[ChatMessage]:
-        """Same as _build_messages but injects engaged-person + realtime context."""
-        content = persona.render_system_prompt()
-        # Inject current time — LLM has no realtime clock, so tell it explicitly
-        # each request. Without this, 'jam berapa?' yields hallucinated answers.
-        content += f"\n\nWAKTU SEKARANG: {_now_indonesian()}"
-        if session.last_engaged_name:
-            content += (
-                f"\n\nKONTEKS PERCAKAPAN INI:\n"
-                f"Kamu sedang ngobrol dengan {session.last_engaged_name}. "
-                f"Sapa dengan namanya saat natural saja, tidak setiap pesan."
-            )
-        system: ChatMessage = {"role": "system", "content": content}
-        return [system, *session.history[-(settings.memory_max_turns * 2) :]]
+                await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
+                break  # task finished within timeout window
+            except asyncio.TimeoutError:
+                if idx >= len(fillers):
+                    # Out of fillers; handle any pending light chat then wait
+                    async for ev in self.handle_light_chat_if_pending(session):
+                        yield ev
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    break
+                filler = fillers[idx]
+                idx += 1
+                async for ev in self.speak(session, filler, ephemeral=True):
+                    ev_type = ev.get("type")
+                    if ev_type in ("done", "timing"):
+                        continue
+                    if ev_type == "ai_text" and ev.get("is_final"):
+                        continue
+                    yield ev
+                # After each filler, acknowledge any queued light-chat message
+                async for ev in self.handle_light_chat_if_pending(session):
+                    yield ev
+            except asyncio.CancelledError:
+                raise
 
     # ─── Canned-speech path (R4) ────────────────────────────────────────────
     # Bypasses the LLM for the simple greet/ask-name lines so we avoid extra
@@ -762,7 +432,7 @@ class Orchestrator:
     # the audio + viseme + lip-sync work identically to LLM-generated speech.
 
     async def speak(
-        self, session: SessionState, text: str
+        self, session: SessionState, text: str, *, ephemeral: bool = False
     ) -> AsyncIterator[dict[str, Any]]:
         """Render `text` as if Pointer said it: split into sentences, TTS each
         in parallel, emit ai_text + audio + viseme events in order."""
@@ -784,16 +454,17 @@ class Orchestrator:
             yield {"type": "done", "reason": "empty_text"}
             return
 
+        # Batch-prep all sentences in one LLM call (all text is known upfront
+        # here, unlike handle_text where sentences arrive one-by-one).
+        prepped = await self._speech_prep.prepare_batch(sentences)
+        for orig, spk in zip(sentences, prepped):
+            if spk != orig:
+                logger.debug(f"[speech-prep] {orig[:60]!r} -> {spk[:60]!r}")
+
         async def render_sentence(
-            sentence: str, idx: int, seq: int
+            spoken: str, idx: int, seq: int
         ) -> dict[str, Any]:
             tts_t0 = time.perf_counter()
-            # Naturalize formal Indonesian -> spoken style + respell English
-            # phonetically. UI sees the LLM's original text; TTS sees the
-            # rewritten version. Adds latency only when needed (heuristic skip).
-            spoken = await self._prepare_for_speech(sentence)
-            if spoken != sentence:
-                logger.debug(f"[speech-prep] {sentence[:60]!r} -> {spoken[:60]!r}")
             result = await self._tts.synthesize(
                 spoken,
                 voice=persona.voice.voice_id,
@@ -819,8 +490,8 @@ class Orchestrator:
             }
 
         tasks = [
-            asyncio.create_task(render_sentence(s, i, i))
-            for i, s in enumerate(sentences)
+            asyncio.create_task(render_sentence(prepped[i], i, i))
+            for i in range(len(sentences))
         ]
 
         # Emit ai_text + audio + viseme for each sentence in order
@@ -841,13 +512,9 @@ class Orchestrator:
             yield payload["audio_event"]
 
         full = " ".join(sentences)
-        session.append("assistant", full)
-        try:
-            await get_chat_history().append(
-                session.engaged_person_id, "assistant", full
-            )
-        except Exception as exc:
-            logger.warning(f"chat_history append(assistant/speak) failed: {exc}")
+        if not ephemeral:
+            session.append("assistant", full)
+            self._persist(session.engaged_person_id, "assistant", full)
         total_ms = int((time.perf_counter() - t0) * 1000)
         yield {
             "type": "ai_text",
@@ -865,18 +532,32 @@ class Orchestrator:
         yield {"type": "done"}
 
     async def greet_known(
-        self, session: SessionState, person_name: str
+        self, session: SessionState, person_name: str, mood: str = "neutral"
     ) -> AsyncIterator[dict[str, Any]]:
-        line = f"Halo {person_name}, ada yang bisa aku bantu?"
-        logger.info(f"[face] greet_known('{person_name}')")
+        _greet_lines: dict[str, str] = {
+            "happy":    f"Halo {person_name}! Kamu terlihat semangat hari ini, ada yang bisa aku bantu?",
+            "focused":  f"Halo {person_name}, sepertinya sedang sibuk. Ada yang perlu aku bantu?",
+            "confused": f"Halo {person_name}! Sepertinya ada yang membingungkan? Aku siap membantu.",
+            "tired":    f"Halo {person_name}. Semoga harimu baik-baik saja, ada yang bisa aku bantu?",
+            "neutral":  f"Halo {person_name}, ada yang bisa aku bantu?",
+        }
+        line = _greet_lines.get(mood, _greet_lines["neutral"])
+        logger.info(f"[face] greet_known('{person_name}', mood='{mood}')")
         async for ev in self.speak(session, line):
             yield ev
 
     async def ask_name(
-        self, session: SessionState
+        self, session: SessionState, mood: str = "neutral"
     ) -> AsyncIterator[dict[str, Any]]:
-        line = "Halo, sepertinya kita belum berkenalan. Boleh aku tau namamu?"
-        logger.info("[face] ask_name()")
+        _ask_lines: dict[str, str] = {
+            "happy":    "Halo! Senang melihatmu di sini! Sepertinya kita belum berkenalan, boleh aku tau namamu?",
+            "focused":  "Halo, ada yang bisa aku bantu? Oh ya, boleh aku tau namamu dulu?",
+            "confused": "Halo! Kelihatannya ada yang membingungkan? Boleh aku tau namamu dulu supaya aku bisa bantu lebih baik?",
+            "tired":    "Halo, sepertinya hari yang panjang ya. Boleh aku tau namamu?",
+            "neutral":  "Halo, sepertinya kita belum berkenalan. Boleh aku tau namamu?",
+        }
+        line = _ask_lines.get(mood, _ask_lines["neutral"])
+        logger.info(f"[face] ask_name(mood='{mood}')")
         async for ev in self.speak(session, line):
             yield ev
 
@@ -888,92 +569,6 @@ class Orchestrator:
         async for ev in self.speak(session, line):
             yield ev
 
-    async def extract_name(self, user_text: str) -> str | None:
-        """Use the LLM to pull a clean name from a free-form response.
-
-        Returns the name string, or None if the response doesn't contain one.
-        """
-        messages: list[ChatMessage] = [
-            {
-                "role": "system",
-                "content": (
-                    "Tugasmu: dari teks user yang membalas pertanyaan 'siapa namamu?', "
-                    "ekstrak HANYA namanya. Format keluaran: nama saja, tanpa kalimat, "
-                    "tanpa tanda kutip. Kapitalisasi yang benar (mis. 'Rezar Aulia').\n"
-                    "Kalau teks tidak mengandung nama yang jelas, jawab: UNCLEAR\n"
-                    "Contoh:\n"
-                    "- 'Aku Reza' → Reza\n"
-                    "- 'Nama saya Rezar Aulia' → Rezar Aulia\n"
-                    "- 'panggil aja reza aja' → Reza\n"
-                    "- 'I am John' → John\n"
-                    "- 'halo apa kabar' → UNCLEAR"
-                ),
-            },
-            {"role": "user", "content": user_text},
-        ]
-        try:
-            raw = await self._llm.generate(messages, temperature=0.2, max_tokens=24)
-        except Exception as exc:
-            logger.warning(f"extract_name LLM call failed: {exc}")
-            return None
-        name = raw.strip().strip("\"'.").splitlines()[0].strip()
-        if not name or name.upper() == "UNCLEAR":
-            return None
-        if len(name) > 64 or "\n" in name:
-            return None
-        return name
-
-    async def detect_correction(
-        self, user_text: str, current_name: str
-    ) -> str | None:
-        """If the user is correcting their name, return the new name; else None.
-
-        Two-stage to avoid the LLM cost on every chat message:
-        1. Cheap regex pre-filter for correction keywords.
-        2. LLM classifier only when the pre-filter hits.
-        """
-        if not _CORRECTION_KEYWORDS.search(user_text):
-            return None
-        messages: list[ChatMessage] = [
-            {
-                "role": "system",
-                "content": (
-                    "User berbicara dengan asisten kampus. Asisten baru saja menyimpan "
-                    f"nama user sebagai '{current_name}'.\n"
-                    "Tugasmu: tentukan apakah teks user ini adalah KOREKSI NAMA "
-                    "(meminta asisten mengganti nama tersimpan), atau bukan.\n"
-                    "Format keluaran (PERSIS satu baris, tanpa apapun lain):\n"
-                    "- 'CORRECT: <NamaBaru>' jika koreksi DAN nama baru jelas\n"
-                    "- 'CORRECT: ?'        jika koreksi tapi nama baru belum jelas\n"
-                    "- 'NO'                jika bukan koreksi (chat biasa)\n"
-                    "Contoh:\n"
-                    "- 'nama saya salah, aku Reza' → CORRECT: Reza\n"
-                    "- 'bukan, namaku Rezar Aulia' → CORRECT: Rezar Aulia\n"
-                    "- 'panggil saja Andi'         → CORRECT: Andi\n"
-                    "- 'nama saya salah'           → CORRECT: ?\n"
-                    "- 'bagaimana cuaca hari ini?' → NO\n"
-                    "- 'halo apa kabar Tiago'      → NO"
-                ),
-            },
-            {"role": "user", "content": user_text},
-        ]
-        try:
-            raw = await self._llm.generate(messages, temperature=0.1, max_tokens=32)
-        except Exception as exc:
-            logger.warning(f"detect_correction LLM call failed: {exc}")
-            return None
-        line = raw.strip().splitlines()[0].strip() if raw.strip() else ""
-        if line.upper().startswith("NO") or not line:
-            return None
-        if not line.upper().startswith("CORRECT:"):
-            return None
-        new_name = line.split(":", 1)[1].strip().strip("\"'.")
-        if not new_name or new_name == "?":
-            return None
-        if len(new_name) > 64 or "\n" in new_name:
-            return None
-        return new_name
-
     async def confirm_correction(
         self, session: SessionState, old_name: str, new_name: str
     ) -> AsyncIterator[dict[str, Any]]:
@@ -984,14 +579,22 @@ class Orchestrator:
         async for ev in self.speak(session, line):
             yield ev
 
-
-# Cheap keyword filter: skip the LLM correction-detection call entirely unless
-# the user's text contains at least one of these tokens. Tuned for Bahasa Indonesia
-# with a few English variants ('wrong', 'not', 'call me').
-_CORRECTION_KEYWORDS = re.compile(
-    r"\b(salah|bukan|ganti|perbaiki|ralat|koreksi|panggil|wrong|not\s+\w+|call\s+me)\b",
-    re.IGNORECASE,
-)
+    async def probe_mood(
+        self, session: SessionState, person_name: str, mood: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Proactively comment when a known user's mood shifts to something noteworthy."""
+        _mood_lines: dict[str, str] = {
+            "tired":    f"{person_name}, kamu kelihatan lelah. Mau istirahat sebentar, atau ada yang bisa aku bantu biar lebih ringan?",
+            "confused": f"Hei {person_name}, sepertinya ada yang bikin bingung? Cerita aja, aku siap bantu.",
+            "happy":    f"Wah, kamu kelihatan happy nih {person_name}! Ada kabar baik yang mau diceritain?",
+            "focused":  f"Tetap semangat ya {person_name}, aku di sini kalau butuh bantuan.",
+        }
+        line = _mood_lines.get(mood)
+        if not line:
+            return
+        logger.info(f"[face] probe_mood('{person_name}', mood='{mood}')")
+        async for ev in self.speak(session, line, ephemeral=True):
+            yield ev
 
 
 _orchestrator: Orchestrator | None = None
